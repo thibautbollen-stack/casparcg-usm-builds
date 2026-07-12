@@ -1,0 +1,27 @@
+From 5e27ec1c22b68ec4cfd8bcdf7b786608b589c103 Mon Sep 17 00:00:00 2001
+From: C-alcaide <calcaide@tres60.tv>
+Date: Mon, 16 Mar 2026 16:33:41 +0100
+Subject: [PATCH] fix(executor): prevent race condition where slow thread
+ startup drops batch commands
+
+Resolves #1687. If stop() was called before the executor's internal thread reached the while loop, is_running_ would be false and the thread would exit immediately without executing any queued tasks. By relying strictly on the existing nullptr poison pill, bounded queues will reliably drain before destruction.
+---
+ src/common/executor.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/common/executor.h b/src/common/executor.h
+index 5b0ecdff..753a43a6 100644
+--- a/src/common/executor.h
++++ b/src/common/executor.h
+@@ -135,7 +135,7 @@ class executor final
+ 
+         task_t task;
+ 
+-        while (is_running_) {
++        while (true) {
+             try {
+                 queue_.pop(task);
+                 do {
+-- 
+2.54.0
+
