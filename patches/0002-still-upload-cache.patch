@@ -1,0 +1,235 @@
+--- a/src/accelerator/ogl/util/device.cpp
++++ b/src/accelerator/ogl/util/device.cpp
+@@ -40,6 +40,7 @@
+ 
+ #include <boost/asio/deadline_timer.hpp>
+ #include <boost/asio/dispatch.hpp>
++#include <boost/asio/post.hpp>
+ #include <boost/asio/spawn.hpp>
+ #include <boost/property_tree/ptree.hpp>
+ 
+@@ -47,8 +48,11 @@
+ #include <tbb/concurrent_unordered_map.h>
+ 
+ #include <array>
++#include <chrono>
+ #include <future>
++#include <list>
+ #include <thread>
++#include <unordered_map>
+ 
+ namespace caspar { namespace accelerator { namespace ogl {
+ 
+@@ -66,6 +70,63 @@
+ 
+     GLuint fbo_;
+ 
++    // USM patch v2 (upload-cache) — implements the upstream "TODO (perf) save
++    // tex on source" in copy_async below, for STILL frames only. A host-side
++    // still (full-canvas composites, test patterns) was re-uploaded to the GPU
++    // on EVERY tick it is composited (~33 MB per 2160p frame, 50×/s).
++    //
++    // TWO-SIGHTING RULE (the v1 lesson, measured on the rig 2026-07-11): only
++    // a source buffer seen ALIVE twice, with the sightings >=10ms apart (i.e.
++    // spanning ticks — a frame shared across layers/channels is sighted
++    // several times within ONE tick and must not qualify), is cached. A
++    // playing video uses a fresh buffer every frame → never qualifies → takes
++    // the ORIGINAL pooled path, byte-identical to stock (v1 cached every
++    // device-backed source, which made every video frame allocate an
++    // un-pooled 4K GL texture → mix p50 1-2ms → 16ms). A still presents the
++    // SAME live buffer every tick → the second tick promotes it: one texture
++    // kept OUT of the pools (a pooled wrapper's deleter captures
++    // shared_from_this; caching one here would cycle impl→cache→deleter→impl
++    // and the device would never destruct), created with a deleter that
++    // routes destruction to the device thread — texture::~texture calls
++    // glDeleteTextures directly, and a frame may drop the last reference on
++    // a stage/producer thread (audit 2026-07-11).
++    //
++    // Contract: promoted bytes are treated as immutable while their handle
++    // lives — true for every current producer (CEF repaints allocate a new
++    // buffer; ffmpeg/NDI/image are write-once per frame).
++    //
++    // Aliasing safety: a hit/promote requires the recorded weak_ptr to the
++    // caller's pooled-buffer HANDLE to still lock — a live handle means the
++    // buffer never returned to the pool, so the key pointer cannot refer to
++    // recycled content. All access happens on the device thread (inside
++    // dispatch_async) — no locking needed.
++    struct upload_seen_entry
++    {
++        std::weak_ptr<buffer>                 source;
++        size_t                                size;
++        int                                   width;
++        int                                   height;
++        int                                   stride;
++        common::bit_depth                     depth;
++        std::chrono::steady_clock::time_point first_seen;
++    };
++    struct upload_cache_entry
++    {
++        std::weak_ptr<buffer>            source;
++        size_t                           size;
++        int                              width;
++        int                              height;
++        int                              stride;
++        common::bit_depth                depth;
++        std::shared_ptr<texture>         tex;
++        std::list<const void*>::iterator lru_it;
++    };
++    static constexpr size_t                              upload_cache_max_entries = 16;
++    static constexpr size_t                              upload_seen_max_entries  = 256;
++    std::unordered_map<const void*, upload_seen_entry>   upload_seen_;
++    std::unordered_map<const void*, upload_cache_entry>  upload_cache_;
++    std::list<const void*>                               upload_cache_lru_; // front = hottest
++
+     std::wstring version_;
+ 
+     io_context                          io_context_;
+@@ -125,6 +186,12 @@
+ 
+         context_->bind();
+ 
++        // USM patch v2 (upload-cache): free cached textures while the context
++        // is bound, before the pools they were sized against are cleared.
++        upload_cache_.clear();
++        upload_cache_lru_.clear();
++        upload_seen_.clear();
++
+         for (auto& pool : host_pools_)
+             pool.clear();
+ 
+@@ -232,9 +299,69 @@
+     copy_async(const array<const uint8_t>& source, int width, int height, int stride, common::bit_depth depth)
+     {
+         return dispatch_async([=] {
+-            std::shared_ptr<buffer> buf;
++            const void* key = source.data();
++            auto        tmp = source.storage<std::shared_ptr<buffer>>();
+ 
+-            auto tmp = source.storage<std::shared_ptr<buffer>>();
++            // USM patch v2 (upload-cache): fast path — a previously promoted
++            // still whose owning handle is still alive.
++            auto hit = upload_cache_.find(key);
++            if (hit != upload_cache_.end()) {
++                auto&      e      = hit->second;
++                const auto locked = e.source.lock();
++                if (locked && locked->data() == key && e.size == source.size() && e.width == width &&
++                    e.height == height && e.stride == stride && e.depth == depth) {
++                    upload_cache_lru_.splice(upload_cache_lru_.begin(), upload_cache_lru_, e.lru_it);
++                    return e.tex;
++                }
++                upload_cache_lru_.erase(e.lru_it);
++                upload_cache_.erase(hit);
++            }
++
++            // Two-sighting promote decision (device-backed sources only).
++            bool       promote          = false;
++            const auto now_ts           = std::chrono::steady_clock::now();
++            auto       first_seen_carry = now_ts;
++            if (tmp) {
++                auto seen = upload_seen_.find(key);
++                if (seen != upload_seen_.end()) {
++                    auto&      s          = seen->second;
++                    const auto lockedSeen = s.source.lock();
++                    if (lockedSeen && lockedSeen->data() == key && s.size == source.size() && s.width == width &&
++                        s.height == height && s.stride == stride && s.depth == depth) {
++                        // Same LIVE buffer sighted again. Promote only if the
++                        // sightings span ticks (>=10ms): a frame composited on
++                        // several layers/channels is sighted repeatedly within
++                        // one tick, and promoting per-frame content would put
++                        // un-pooled GL allocations on the hot path (the v1
++                        // regression). A genuine still re-qualifies one tick
++                        // (20ms) later at zero cost.
++                        if (now_ts - s.first_seen >= std::chrono::milliseconds(10))
++                            promote = true;
++                        else
++                            first_seen_carry = s.first_seen; // keep original sighting time
++                    }
++                    upload_seen_.erase(seen);
++                }
++                if (!promote) {
++                    if (upload_seen_.size() >= upload_seen_max_entries) {
++                        // Prune expired sightings; if none expired (can't
++                        // happen in practice — the pool cycles few pointers),
++                        // fall back to clearing to keep this bounded.
++                        for (auto it = upload_seen_.begin(); it != upload_seen_.end();) {
++                            if (it->second.source.expired())
++                                it = upload_seen_.erase(it);
++                            else
++                                ++it;
++                        }
++                        if (upload_seen_.size() >= upload_seen_max_entries)
++                            upload_seen_.clear();
++                    }
++                    upload_seen_[key] = upload_seen_entry{
++                        std::weak_ptr<buffer>(*tmp), source.size(), width, height, stride, depth, first_seen_carry};
++                }
++            }
++
++            std::shared_ptr<buffer> buf;
+             if (tmp) {
+                 buf = *tmp;
+             } else {
+@@ -243,9 +370,37 @@
+                 std::memcpy(buf->data(), source.data(), source.size());
+             }
+ 
+-            auto tex = create_texture(width, height, stride, depth, false);
++            if (!promote) {
++                // The ORIGINAL pooled path — byte-identical to stock for every
++                // first-sighted buffer (i.e. all playing video frames).
++                auto tex = create_texture(width, height, stride, depth, false);
++                tex->copy_from(*buf);
++                return tex;
++            }
++
++            // Promoted still: one un-pooled texture, cached and reused. The
++            // deleter routes destruction to the device thread (see header
++            // comment); weak_ptr — not shared — so the cache entry cannot
++            // keep impl alive through its own member. If the device is
++            // already gone the GL context is gone too and the inline
++            // fallback delete's glDeleteTextures is inert.
++            auto tex = std::shared_ptr<texture>(new texture(width, height, stride, depth),
++                                                [w = weak_from_this()](texture* p) {
++                                                    if (auto self = w.lock())
++                                                        post(self->io_context_, [p] { delete p; });
++                                                    else
++                                                        delete p;
++                                                });
+             tex->copy_from(*buf);
+-            // TODO (perf) save tex on source
++
++            upload_cache_lru_.push_front(key);
++            upload_cache_[key] = upload_cache_entry{std::weak_ptr<buffer>(*tmp), source.size(), width,   height,
++                                                    stride,                      depth,         tex,     upload_cache_lru_.begin()};
++            while (upload_cache_.size() > upload_cache_max_entries) {
++                const void* victim = upload_cache_lru_.back();
++                upload_cache_.erase(victim);
++                upload_cache_lru_.pop_back();
++            }
+             return tex;
+         });
+     }
+@@ -372,6 +527,23 @@
+             CASPAR_LOG(info) << " ogl: Running GC.";
+ 
+             try {
++                // USM patch v2 (upload-cache): GL GC is the operator's VRAM
++                // reclaim lever — also drop cache entries whose source handle
++                // has died (their textures are freed here, on this thread)
++                // and expired sightings, so cleared layers can't pin VRAM.
++                for (auto it = upload_cache_.begin(); it != upload_cache_.end();) {
++                    if (it->second.source.expired()) {
++                        upload_cache_lru_.erase(it->second.lru_it);
++                        it = upload_cache_.erase(it);
++                    } else
++                        ++it;
++                }
++                for (auto it = upload_seen_.begin(); it != upload_seen_.end();) {
++                    if (it->second.source.expired())
++                        it = upload_seen_.erase(it);
++                    else
++                        ++it;
++                }
+                 for (auto& depth_pools : device_pools_) {
+                     for (auto& pools : depth_pools) {
+                         for (auto& pool : pools)

@@ -1,0 +1,45 @@
+--- a/src/modules/screen/consumer/screen_consumer.cpp
++++ b/src/modules/screen/consumer/screen_consumer.cpp
+@@ -196,7 +196,15 @@
+             }
+         }
+ 
+-        frame_buffer_.set_capacity(1);
++        // USM patch (ingress-depth): capacity 1 -> 2. With ZERO slack, a frame
++        // arriving even 1ms past the tick blocks the channel thread in send()
++        // (up to 3x 1ms retries) or drops. Rig telemetry (2026-07-11) showed
++        // 26-42 frames/min arriving ~1ms late during busy playout — pure pace
++        // jitter the single-slot queue cannot absorb. One extra slot lets the
++        // present thread run a frame behind and swallow that jitter, at the
++        // cost of ONE frame (~20ms @50p) of output latency — irrelevant for
++        // LED signage. Analogous to the DeckLink consumer's <buffer-depth>.
++        frame_buffer_.set_capacity(2);
+ 
+         graph_->set_color("tick-time", diagnostics::color(0.0f, 0.6f, 0.9f));
+         graph_->set_color("frame-time", diagnostics::color(0.1f, 1.0f, 0.1f));
+@@ -424,14 +432,22 @@
+     {
+         const int MAX_TRIES = 3;
+         int       count     = 0;
+-        while (count++ < MAX_TRIES && is_running_) {
+-            if (frame_buffer_.try_push(frame))
++        bool      delivered = false;
++        while (count++ < MAX_TRIES && is_running_) {
++            if (frame_buffer_.try_push(frame)) {
++                delivered = true;
+                 break;
++            }
+ 
+             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+         }
+ 
+-        if (count == MAX_TRIES) {
++        // USM patch (ingress-depth): upstream tagged `count == MAX_TRIES`,
++        // which fires on a push that SUCCEEDS on the final retry and stays
++        // silent on an actual drop (count is MAX_TRIES+1 after a full
++        // failure) — inverted. Tag genuine drops only, so the dropped-frame
++        // diagnostic means what it says.
++        if (!delivered && is_running_) {
+             graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
+         }
+ 

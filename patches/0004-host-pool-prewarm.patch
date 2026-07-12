@@ -1,0 +1,71 @@
+--- a/src/accelerator/ogl/util/device.cpp
++++ b/src/accelerator/ogl/util/device.cpp
+@@ -48,6 +48,7 @@
+ #include <tbb/concurrent_unordered_map.h>
+ 
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <future>
+ #include <list>
+@@ -67,6 +68,17 @@
+ 
+     std::array<std::array<tbb::concurrent_unordered_map<size_t, texture_queue_t>, 4>, 2> device_pools_;
+     std::array<tbb::concurrent_unordered_map<size_t, buffer_queue_t>, 2>                 host_pools_;
++
++    // USM patch (pool-prewarm): first miss of a buffer size tops that pool up
++    // asynchronously (see create_buffer). Once per (write,size) per session,
++    // bounded by a byte budget so unusual sizes cannot balloon memory.
++    // NOTE: this patch is diffed against device.cpp WITH the upload-cache
++    // patch (0002) already applied — order matters, and a wrong order fails
++    // `git apply` loudly.
++    std::array<tbb::concurrent_unordered_map<size_t, bool>, 2> prewarmed_sizes_;
++    std::atomic<size_t>                                        prewarm_bytes_{0};
++    static constexpr int    PREWARM_EXTRA       = 3;
++    static constexpr size_t PREWARM_BYTE_BUDGET = size_t{256} * 1024 * 1024;
+ 
+     GLuint fbo_;
+ 
+@@ -279,6 +291,42 @@
+         if (!pool->try_pop(buf)) {
+             // TODO (perf) Avoid blocking in create_array.
+             dispatch_sync([&] { buf = std::make_shared<buffer>(size, write); });
++
++            // USM patch (pool-prewarm): this caller already paid the blocking
++            // GL-thread allocation above. During a transition burst (composite
++            // + mirror layers loading together) every sibling pays it too, and
++            // those allocation tasks interleave with mix work on the GL thread
++            // -- the residual first-time spikes. On the FIRST miss of a size,
++            // top its pool up asynchronously so the rest of the burst pops
++            // from the pool instead of blocking.
++            //
++            // post() (never dispatch) so a GL-thread caller cannot run the
++            // top-up inline. Raw `this` is safe by construction (audit
++            // 2026-07-11): asio handlers only execute inside io_context_.run()
++            // on thread_, and ~impl releases the work guard and JOINS that
++            // thread BEFORE any member is destroyed — every queued handler,
++            // including one queued mid-shutdown, runs to completion while impl
++            // is fully alive. (A weak_ptr lock here could instead resurrect
++            // the LAST reference on the GL thread and make ~impl self-join.)
++            const auto wi          = static_cast<int>(write ? 1 : 0);
++            const auto extra_bytes = static_cast<size_t>(size) * PREWARM_EXTRA;
++            if (prewarm_bytes_.load(std::memory_order_relaxed) + extra_bytes <= PREWARM_BYTE_BUDGET &&
++                prewarmed_sizes_[wi].insert({static_cast<size_t>(size), true}).second) {
++                prewarm_bytes_ += extra_bytes;
++                post(io_context_, [this, size, write] {
++                    // GL allocation can throw (ogl OOM). This is a bare asio
++                    // handler — not a packaged_task — and an escaped exception
++                    // would exit run() and take down the server. The top-up is
++                    // an optimization: on failure, log and stop topping up.
++                    try {
++                        auto pool = &host_pools_[static_cast<int>(write ? 1 : 0)][size];
++                        for (int i = 0; i < PREWARM_EXTRA; ++i)
++                            pool->push(std::make_shared<buffer>(size, write));
++                    } catch (...) {
++                        CASPAR_LOG_CURRENT_EXCEPTION();
++                    }
++                });
++            }
+         }
+ 
+         auto ptr = buf.get();
