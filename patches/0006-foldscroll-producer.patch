@@ -1,0 +1,401 @@
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index e69f4b6c..1232bb8e 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -22,6 +22,7 @@ set(SOURCES
+ 		producer/separated/separated_producer.cpp
+ 		producer/transition/transition_producer.cpp
+ 		producer/transition/sting_producer.cpp
++		producer/foldscroll/foldscroll_producer.cpp
+ 		producer/route/route_producer.cpp
+ 
+ 		producer/cg_proxy.cpp
+@@ -62,6 +63,7 @@ set(HEADERS
+ 		producer/separated/separated_producer.h
+ 		producer/transition/transition_producer.h
+ 		producer/transition/sting_producer.h
++		producer/foldscroll/foldscroll_producer.h
+ 		producer/route/route_producer.h
+ 
+ 		producer/cg_proxy.h
+@@ -93,6 +95,7 @@ source_group(sources\\mixer mixer/*)
+ source_group(sources\\mixer\\audio mixer/audio/*)
+ source_group(sources\\mixer\\image mixer/image/*)
+ source_group(sources\\producer\\color producer/color/*)
++source_group(sources\\producer\\foldscroll producer/foldscroll/*)
+ source_group(sources\\producer\\route producer/route/*)
+ source_group(sources\\producer\\transition producer/transition/*)
+ source_group(sources\\producer\\separated producer/separated/*)
+diff --git a/src/core/producer/foldscroll/foldscroll_producer.cpp b/src/core/producer/foldscroll/foldscroll_producer.cpp
+new file mode 100644
+index 00000000..1943b451
+--- /dev/null
++++ b/src/core/producer/foldscroll/foldscroll_producer.cpp
+@@ -0,0 +1,303 @@
++/*
++ * USM patch 0006 — foldscroll:// producer. See foldscroll_producer.h.
++ *
++ * Modeled on src/core/producer/route/route_producer.cpp for the channel-signal
++ * subscription + bounded frame buffer; the difference is receive_impl, which
++ * emits the FOLDED scroll composition (N transform-only children of the one
++ * source frame) instead of a single passthrough copy, advancing the scroll
++ * offset internally each rendered frame. Fold geometry is a C++ port of
++ * scroll-slices.js; per-slice transforms mirror sliceMixerParams.
++ */
++#include "foldscroll_producer.h"
++
++#include <common/except.h>
++#include <common/log.h>
++#include <common/param.h>
++
++#include <core/frame/draw_frame.h>
++#include <core/frame/frame_transform.h>
++#include <core/producer/frame_producer.h>
++#include <core/video_channel.h>
++
++#include <boost/regex.hpp>
++#include <boost/signals2.hpp>
++
++#include <tbb/concurrent_queue.h>
++
++#include <algorithm>
++#include <cmath>
++#include <future>
++#include <mutex>
++#include <optional>
++#include <vector>
++
++namespace caspar { namespace core {
++
++namespace {
++
++constexpr double FS_EPS = 1e-6;
++
++// Positive modulo (matches scroll-slices.js `mod`).
++double fs_mod(double v, double m) { return m > 0.0 ? std::fmod(std::fmod(v, m) + m, m) : 0.0; }
++
++// Closed-loop fold geometry — mirrors scroll-slices.js loopGeometry(). The app
++// passes pw/ph/N and P (panelsPerRow, already floor(outputW/pw)-clamped); the
++// producer derives the rest so the rows tile [0,T) exactly (Σ row_widths = T).
++struct fold_geometry
++{
++    int                 pw = 0, ph = 0, N = 0, P = 0, R = 0, L = 0;
++    double              T = 0.0;
++    std::vector<double> row_starts;
++    std::vector<double> row_widths;
++
++    void init(int pw_, int ph_, int n_, int p_)
++    {
++        pw = pw_;
++        ph = ph_;
++        N  = n_;
++        P  = std::max(1, std::min(std::max(1, n_), p_));
++        R  = (N + P - 1) / P;             // ceil(N / P)
++        L  = N - (R - 1) * P;             // panels in the (possibly partial) last row
++        T  = static_cast<double>(N) * pw; // loop length in px
++        row_starts.assign(R, 0.0);
++        row_widths.assign(R, 0.0);
++        for (int r = 0; r < R; ++r) {
++            row_starts[r] = static_cast<double>(r) * P * pw;
++            row_widths[r] = static_cast<double>((r == R - 1) ? L : P) * pw;
++        }
++    }
++
++    bool valid() const { return pw > 0 && ph > 0 && N > 0 && P > 0 && T > 0.0; }
++};
++
++struct fold_slice
++{
++    int    dst_row, src_row;
++    double dst_x, width, src_x;
++};
++
++// C++ port of scroll-slices.js computeScrollSlices(geom, offset).
++std::vector<fold_slice> compute_slices(const fold_geometry& g, double offset)
++{
++    std::vector<fold_slice> out;
++    const double            s        = fs_mod(offset, g.T);
++    const double            row_span = static_cast<double>(g.P) * g.pw;
++    for (int r = 0; r < g.R; ++r) {
++        const double w     = g.row_widths[r];
++        double       x     = 0.0;
++        int          guard = 0;
++        while (x < w - FS_EPS) {
++            const double u       = fs_mod(g.row_starts[r] + x - s, g.T);
++            const int    src_row = std::min(g.R - 1, static_cast<int>(std::floor(u / row_span)));
++            const double src_x   = u - g.row_starts[src_row];
++            const double len     = std::min(w - x, g.row_widths[src_row] - src_x);
++            if (len > FS_EPS)
++                out.push_back(fold_slice{r, src_row, x, len, src_x});
++            x += std::max(len, FS_EPS); // EPS floor — float noise must not stall the walk
++            if (++guard > 8)            // ≤3 slices/row in exact math; 8 = paranoia
++                break;
++        }
++    }
++    return out;
++}
++
++} // namespace
++
++class foldscroll_producer
++    : public frame_producer
++    , public std::enable_shared_from_this<foldscroll_producer>
++{
++    tbb::concurrent_bounded_queue<std::pair<core::draw_frame, core::draw_frame>> buffer_;
++    std::optional<std::pair<core::draw_frame, core::draw_frame>>                 frame_;
++
++    std::shared_ptr<route>  route_;
++    const video_format_desc format_desc_;
++    const int               source_channel_;
++    const fold_geometry     geom_;
++
++    std::mutex param_mutex_;
++    double     offset_ = 0.0;
++    double     speed_  = 0.0; // magnitude, px per SECOND (divided by channel hz per tick)
++    int        dir_    = 1;   // +1 / -1
++
++    boost::signals2::scoped_connection connection_;
++
++  public:
++    foldscroll_producer(std::shared_ptr<route>  route,
++                        video_format_desc       format_desc,
++                        int                     source_channel,
++                        const fold_geometry&    geom,
++                        double                  speed_px_per_sec,
++                        int                     dir)
++        : route_(std::move(route))
++        , format_desc_(std::move(format_desc))
++        , source_channel_(source_channel)
++        , geom_(geom)
++        , speed_(std::abs(speed_px_per_sec))
++        , dir_(dir >= 0 ? 1 : -1)
++    {
++        // Cross-channel ingress (this producer lives on a different channel than
++        // its source), so buffer depth 2 — matches the app's route:// usage.
++        buffer_.set_capacity(2);
++        CASPAR_LOG(info) << print() << L" Initialized (" << geom_.R << L" rows, T=" << static_cast<int64_t>(geom_.T)
++                         << L", speed=" << speed_ << L" px/s, dir=" << dir_ << L")";
++    }
++
++    void connect_slot()
++    {
++        auto weak_self = weak_from_this();
++        connection_ =
++            route_->signal.connect([weak_self](const core::draw_frame& frame1, const core::draw_frame& frame2) {
++                if (auto self = weak_self.lock()) {
++                    auto f1 = frame1;
++                    if (!f1)
++                        f1 = core::draw_frame::push(frame1);
++                    auto f2 = frame2;
++                    if (!f2)
++                        f2 = f1;
++                    self->buffer_.try_push(std::make_pair(f1, f2)); // drop-on-full → shows last frame
++                }
++            });
++    }
++
++    draw_frame last_frame(const core::video_field field) override
++    {
++        // Never advance the offset from last_frame (freeze-frame while off-air),
++        // but do pop a buffered frame so the very first call isn't black
++        // (mirrors route_producer::last_frame).
++        if (!frame_) {
++            std::pair<core::draw_frame, core::draw_frame> f;
++            if (buffer_.try_pop(f))
++                frame_ = f;
++        }
++        if (!frame_)
++            return core::draw_frame{};
++        return core::draw_frame::still(build_fold(field, /*advance=*/false));
++    }
++
++    draw_frame receive_impl(const core::video_field field, int nb_samples) override
++    {
++        if (field == core::video_field::a || field == core::video_field::progressive) {
++            std::pair<core::draw_frame, core::draw_frame> f;
++            if (buffer_.try_pop(f))
++                frame_ = f;
++        }
++        if (!frame_)
++            return core::draw_frame{};
++
++        // Advance once per rendered frame — only on the real receive path
++        // (nb_samples > 0); last_frame/first_frame pass 0 and must not scroll.
++        const bool advance = nb_samples > 0 && (field == core::video_field::a || field == core::video_field::progressive);
++        return build_fold(field, advance);
++    }
++
++    bool is_ready() override { return true; }
++
++    std::future<std::wstring> call(const std::vector<std::wstring>& params) override
++    {
++        {
++            std::lock_guard<std::mutex> lk(param_mutex_);
++            if (contains_param(L"SPEED", params))
++                speed_ = std::abs(get_param(L"SPEED", params, speed_));
++            if (contains_param(L"DIR", params))
++                dir_ = get_param(L"DIR", params, dir_) >= 0 ? 1 : -1;
++            if (contains_param(L"OFFSET", params))
++                offset_ = fs_mod(get_param(L"OFFSET", params, offset_), geom_.T);
++        }
++        std::promise<std::wstring> p;
++        p.set_value(L"");
++        return p.get_future();
++    }
++
++    std::wstring print() const override { return L"foldscroll[" + std::to_wstring(source_channel_) + L"]"; }
++
++    std::wstring name() const override { return L"foldscroll"; }
++
++    core::monitor::state state() const override
++    {
++        core::monitor::state st;
++        st["foldscroll/channel"] = source_channel_;
++        st["foldscroll/rows"]    = geom_.R;
++        return st;
++    }
++
++  private:
++    // Build the folded draw_frame for the current field. When `advance`, step the
++    // scroll offset first. Returns N transform-only children of the source frame.
++    draw_frame build_fold(const core::video_field field, bool advance)
++    {
++        const core::draw_frame& src = (field == core::video_field::b) ? frame_->second : frame_->first;
++
++        double offset;
++        {
++            std::lock_guard<std::mutex> lk(param_mutex_);
++            if (advance) {
++                // hz = channel TICKRATE (i50 = 25, p60 = 60). We advance once per
++                // rendered tick, so hz — not fps (fieldrate) — converts px/s → px/tick.
++                const double hz = format_desc_.hz > 0.0 ? format_desc_.hz : 60.0;
++                offset_ = fs_mod(offset_ + static_cast<double>(dir_) * (speed_ / hz), geom_.T);
++            }
++            offset = offset_;
++        }
++
++        const double W = static_cast<double>(format_desc_.width);
++        const double H = static_cast<double>(format_desc_.height);
++        if (!(W > 0.0) || !(H > 0.0) || !geom_.valid())
++            return src; // degenerate geometry → passthrough rather than a broken fold
++
++        const auto                    slices = compute_slices(geom_, offset);
++        std::vector<core::draw_frame> children;
++        children.reserve(slices.size());
++        for (const auto& s : slices) {
++            core::draw_frame child = src; // copy shares the source texture (one route, N quads)
++            auto&            it    = child.transform().image_transform;
++            it.fill_translation = {(s.dst_x - s.src_x) / W,
++                                   (static_cast<double>(s.dst_row - s.src_row) * geom_.ph) / H};
++            it.clip_translation = {s.dst_x / W, (static_cast<double>(s.dst_row) * geom_.ph) / H};
++            it.clip_scale       = {s.width / W, static_cast<double>(geom_.ph) / H};
++            it.enable_geometry_modifiers = true;
++            // Slices are visual-only — mute so the mixer doesn't sum N copies of
++            // the source audio (mirrors the app slice engine's MIXER VOLUME 0).
++            child.transform().audio_transform.volume = 0.0;
++            children.push_back(std::move(child));
++        }
++        if (children.empty())
++            return core::draw_frame{};
++        return core::draw_frame(std::move(children));
++    }
++};
++
++spl::shared_ptr<core::frame_producer> create_foldscroll_producer(const core::frame_producer_dependencies& dependencies,
++                                                                 const std::vector<std::wstring>&         params)
++{
++    static boost::wregex expr(L"foldscroll://(?<CHANNEL>\\d+)(-(?<LAYER>\\d+))?", boost::regex::icase);
++    boost::wsmatch       what;
++
++    if (params.empty() || !boost::regex_match(params.at(0), what, expr))
++        return core::frame_producer::empty();
++
++    const int channel = std::stoi(what["CHANNEL"].str());
++    const int layer   = what["LAYER"].matched ? std::stoi(what["LAYER"].str()) : -1;
++
++    auto channel_it = std::find_if(dependencies.channels.begin(),
++                                   dependencies.channels.end(),
++                                   [=](const spl::shared_ptr<core::video_channel>& ch) { return ch->index() == channel; });
++    if (channel_it == dependencies.channels.end())
++        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"foldscroll: no channel with id " + std::to_wstring(channel)));
++
++    fold_geometry geom;
++    geom.init(get_param(L"PW", params, 0), get_param(L"PH", params, 0), get_param(L"N", params, 0),
++              get_param(L"P", params, 0));
++    if (!geom.valid())
++        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"foldscroll: needs positive PW PH N P"));
++
++    const double speed = std::abs(get_param(L"SPEED", params, 0.0));
++    const int    dir   = get_param(L"DIR", params, 1) >= 0 ? 1 : -1;
++
++    auto producer = spl::make_shared<foldscroll_producer>(
++        (*channel_it)->route(layer, core::route_mode::foreground), dependencies.format_desc, channel, geom, speed, dir);
++    producer->connect_slot();
++    return producer;
++}
++
++}} // namespace caspar::core
+diff --git a/src/core/producer/foldscroll/foldscroll_producer.h b/src/core/producer/foldscroll/foldscroll_producer.h
+new file mode 100644
+index 00000000..e76e8816
+--- /dev/null
++++ b/src/core/producer/foldscroll/foldscroll_producer.h
+@@ -0,0 +1,31 @@
++/*
++ * USM patch 0006 — foldscroll:// producer.
++ *
++ * Renders the perimeter-scroll FOLD of a source channel entirely server-side:
++ * one producer, one route subscription, N transform-only sub-frames of the SAME
++ * source texture (the mixer flattens the tree), with the scroll offset advanced
++ * internally every rendered frame. Replaces the app's 24-route-slice + per-frame
++ * MIXER engine — no route-layer GPU blow-up, no tweens, no AMCP motion traffic.
++ *
++ * The fold geometry is a C++ port of scroll-slices.js (loopGeometry +
++ * computeScrollSlices); the per-slice transforms mirror sliceMixerParams.
++ *
++ * URI:   foldscroll://<channel>[-<layer>]
++ * Params: PW <panelWidth> PH <panelHeight> N <totalPanels> P <panelsPerRow>
++ *         SPEED <pxPerFrame> DIR <1|-1>
++ * Live retune via CALL: SPEED <pxPerFrame> | DIR <1|-1> | OFFSET <px>
++ */
++
++#pragma once
++
++#include <core/producer/frame_producer.h>
++
++#include <string>
++#include <vector>
++
++namespace caspar { namespace core {
++
++spl::shared_ptr<core::frame_producer> create_foldscroll_producer(const core::frame_producer_dependencies& dependencies,
++                                                                 const std::vector<std::wstring>&         params);
++
++}} // namespace caspar::core
+diff --git a/src/core/producer/frame_producer_registry.cpp b/src/core/producer/frame_producer_registry.cpp
+index 73509d8f..efdd5366 100644
+--- a/src/core/producer/frame_producer_registry.cpp
++++ b/src/core/producer/frame_producer_registry.cpp
+@@ -27,6 +27,7 @@
+ 
+ #include "color/color_producer.h"
+ #include "route/route_producer.h"
++#include "foldscroll/foldscroll_producer.h" // USM patch 0006
+ #include "separated/separated_producer.h"
+ 
+ #include <boost/algorithm/string/predicate.hpp>
+@@ -149,6 +150,14 @@ spl::shared_ptr<core::frame_producer> do_create_producer(const frame_producer_de
+         return producer;
+     }
+ 
++    // USM patch 0006 — foldscroll:// (perimeter-scroll fold, animations only).
++    // Matches ONLY the literal foldscroll:// scheme; every other URI falls
++    // through to the factories exactly as before.
++    producer = create_foldscroll_producer(dependencies, params);
++    if (producer != frame_producer::empty()) {
++        return producer;
++    }
++
+     if (std::any_of(factories.begin(), factories.end(), [&](const producer_factory_t& factory) -> bool {
+             try {
+                 producer = factory(dependencies, params);
