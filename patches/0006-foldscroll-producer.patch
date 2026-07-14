@@ -28,7 +28,7 @@ index e69f4b6c..1232bb8e 100644
  source_group(sources\\producer\\separated producer/separated/*)
 diff --git a/src/core/producer/foldscroll/foldscroll_producer.cpp b/src/core/producer/foldscroll/foldscroll_producer.cpp
 new file mode 100644
-index 00000000..da667a60
+index 00000000..796d1eee
 --- /dev/null
 +++ b/src/core/producer/foldscroll/foldscroll_producer.cpp
 @@ -0,0 +1,327 @@
@@ -233,6 +233,7 @@ index 00000000..da667a60
 +
 +    std::future<std::wstring> call(const std::vector<std::wstring>& params) override
 +    {
++        double off;
 +        {
 +            std::lock_guard<std::mutex> lk(param_mutex_);
 +            if (contains_param(L"SPEED", params))
@@ -241,10 +242,6 @@ index 00000000..da667a60
 +                dir_ = get_param(L"DIR", params, dir_) >= 0 ? 1 : -1;
 +            if (contains_param(L"OFFSET", params))
 +                offset_ = fs_mod(get_param(L"OFFSET", params, offset_), geom_.T);
-+        }
-+        double off;
-+        {
-+            std::lock_guard<std::mutex> lk(param_mutex_);
 +            off = offset_;
 +        }
 +        // Every CALL replies with the LIVE offset (px into the loop) — a plain
@@ -277,18 +274,21 @@ index 00000000..da667a60
 +        double offset;
 +        {
 +            std::lock_guard<std::mutex> lk(param_mutex_);
-+            if (advance) {
-+                // WALL-CLOCK advance (audit fix): a stage channel with an unpaced
-+                // screen consumer FREE-RUNS well above its mode rate (a rig
-+                // measured ~110 ticks/s against 30 fps), so a fixed per-tick step
-+                // would multiply the operator's speed by the real tick rate ÷ hz
-+                // and wobble with GPU load. Advancing by measured elapsed time
-+                // keeps the speed exact at ANY tick rate. dt is clamped so a
-+                // paused/stalled layer resumes without a jump.
-+                const double dt = std::min(advance_timer_.elapsed(), 0.25);
-+                advance_timer_.restart();
++            // WALL-CLOCK advance (audit fix): a stage channel with an unpaced
++            // screen consumer FREE-RUNS well above its mode rate (a rig
++            // measured ~110 ticks/s against 30 fps), so a fixed per-tick step
++            // would multiply the operator's speed by the real tick rate ÷ hz
++            // and wobble with GPU load. Advancing by measured elapsed time
++            // keeps the speed exact at ANY tick rate.
++            //
++            // The timer restarts on EVERY build — advancing or not — so a
++            // PAUSEd layer (which still builds stills each tick) keeps the
++            // baseline fresh and resumes with NO jump. Only a layer that was
++            // not rendered AT ALL resumes with the clamped dt (≤ 0.25 s).
++            const double dt = std::min(advance_timer_.elapsed(), 0.25);
++            advance_timer_.restart();
++            if (advance)
 +                offset_ = fs_mod(offset_ + static_cast<double>(dir_) * speed_ * dt, geom_.T);
-+            }
 +            offset = offset_;
 +        }
 +
