@@ -28,10 +28,10 @@ index e69f4b6c..1232bb8e 100644
  source_group(sources\\producer\\separated producer/separated/*)
 diff --git a/src/core/producer/foldscroll/foldscroll_producer.cpp b/src/core/producer/foldscroll/foldscroll_producer.cpp
 new file mode 100644
-index 00000000..1943b451
+index 00000000..da667a60
 --- /dev/null
 +++ b/src/core/producer/foldscroll/foldscroll_producer.cpp
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,327 @@
 +/*
 + * USM patch 0006 — foldscroll:// producer. See foldscroll_producer.h.
 + *
@@ -47,6 +47,7 @@ index 00000000..1943b451
 +#include <common/except.h>
 +#include <common/log.h>
 +#include <common/param.h>
++#include <common/timer.h>
 +
 +#include <core/frame/draw_frame.h>
 +#include <core/frame/frame_transform.h>
@@ -150,9 +151,10 @@ index 00000000..1943b451
 +    const fold_geometry     geom_;
 +
 +    std::mutex param_mutex_;
-+    double     offset_ = 0.0;
-+    double     speed_  = 0.0; // magnitude, px per SECOND (divided by channel hz per tick)
-+    int        dir_    = 1;   // +1 / -1
++    double        offset_ = 0.0;
++    double        speed_  = 0.0; // magnitude, px per SECOND (wall-clock)
++    int           dir_    = 1;   // +1 / -1
++    caspar::timer advance_timer_; // wall clock between advances
 +
 +    boost::signals2::scoped_connection connection_;
 +
@@ -162,7 +164,8 @@ index 00000000..1943b451
 +                        int                     source_channel,
 +                        const fold_geometry&    geom,
 +                        double                  speed_px_per_sec,
-+                        int                     dir)
++                        int                     dir,
++                        double                  offset0)
 +        : route_(std::move(route))
 +        , format_desc_(std::move(format_desc))
 +        , source_channel_(source_channel)
@@ -170,6 +173,7 @@ index 00000000..1943b451
 +        , speed_(std::abs(speed_px_per_sec))
 +        , dir_(dir >= 0 ? 1 : -1)
 +    {
++        offset_ = fs_mod(offset0, geom_.T);
 +        // Cross-channel ingress (this producer lives on a different channel than
 +        // its source), so buffer depth 2 — matches the app's route:// usage.
 +        buffer_.set_capacity(2);
@@ -238,8 +242,16 @@ index 00000000..1943b451
 +            if (contains_param(L"OFFSET", params))
 +                offset_ = fs_mod(get_param(L"OFFSET", params, offset_), geom_.T);
 +        }
++        double off;
++        {
++            std::lock_guard<std::mutex> lk(param_mutex_);
++            off = offset_;
++        }
++        // Every CALL replies with the LIVE offset (px into the loop) — a plain
++        // `CALL <ch>-<layer> STATUS` is therefore an offset read, which the app
++        // uses to hand the scroll over to another engine without a snap.
 +        std::promise<std::wstring> p;
-+        p.set_value(L"");
++        p.set_value(std::to_wstring(off));
 +        return p.get_future();
 +    }
 +
@@ -266,10 +278,16 @@ index 00000000..1943b451
 +        {
 +            std::lock_guard<std::mutex> lk(param_mutex_);
 +            if (advance) {
-+                // hz = channel TICKRATE (i50 = 25, p60 = 60). We advance once per
-+                // rendered tick, so hz — not fps (fieldrate) — converts px/s → px/tick.
-+                const double hz = format_desc_.hz > 0.0 ? format_desc_.hz : 60.0;
-+                offset_ = fs_mod(offset_ + static_cast<double>(dir_) * (speed_ / hz), geom_.T);
++                // WALL-CLOCK advance (audit fix): a stage channel with an unpaced
++                // screen consumer FREE-RUNS well above its mode rate (a rig
++                // measured ~110 ticks/s against 30 fps), so a fixed per-tick step
++                // would multiply the operator's speed by the real tick rate ÷ hz
++                // and wobble with GPU load. Advancing by measured elapsed time
++                // keeps the speed exact at ANY tick rate. dt is clamped so a
++                // paused/stalled layer resumes without a jump.
++                const double dt = std::min(advance_timer_.elapsed(), 0.25);
++                advance_timer_.restart();
++                offset_ = fs_mod(offset_ + static_cast<double>(dir_) * speed_ * dt, geom_.T);
 +            }
 +            offset = offset_;
 +        }
@@ -319,17 +337,23 @@ index 00000000..1943b451
 +    if (channel_it == dependencies.channels.end())
 +        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"foldscroll: no channel with id " + std::to_wstring(channel)));
 +
-+    fold_geometry geom;
-+    geom.init(get_param(L"PW", params, 0), get_param(L"PH", params, 0), get_param(L"N", params, 0),
-+              get_param(L"P", params, 0));
-+    if (!geom.valid())
++    // Validate the RAW params — fold_geometry::init clamps P to >= 1, so a
++    // post-init valid() check could never catch a missing/garbage P (audit fix).
++    const int pw = get_param(L"PW", params, 0);
++    const int ph = get_param(L"PH", params, 0);
++    const int n  = get_param(L"N", params, 0);
++    const int pp = get_param(L"P", params, 0);
++    if (pw <= 0 || ph <= 0 || n <= 0 || pp <= 0)
 +        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"foldscroll: needs positive PW PH N P"));
++    fold_geometry geom;
++    geom.init(pw, ph, n, pp);
 +
-+    const double speed = std::abs(get_param(L"SPEED", params, 0.0));
-+    const int    dir   = get_param(L"DIR", params, 1) >= 0 ? 1 : -1;
++    const double speed   = std::abs(get_param(L"SPEED", params, 0.0)); // px per SECOND
++    const int    dir     = get_param(L"DIR", params, 1) >= 0 ? 1 : -1;
++    const double offset0 = get_param(L"OFFSET", params, 0.0);
 +
 +    auto producer = spl::make_shared<foldscroll_producer>(
-+        (*channel_it)->route(layer, core::route_mode::foreground), dependencies.format_desc, channel, geom, speed, dir);
++        (*channel_it)->route(layer, core::route_mode::foreground), dependencies.format_desc, channel, geom, speed, dir, offset0);
 +    producer->connect_slot();
 +    return producer;
 +}
@@ -337,10 +361,10 @@ index 00000000..1943b451
 +}} // namespace caspar::core
 diff --git a/src/core/producer/foldscroll/foldscroll_producer.h b/src/core/producer/foldscroll/foldscroll_producer.h
 new file mode 100644
-index 00000000..e76e8816
+index 00000000..27ec349c
 --- /dev/null
 +++ b/src/core/producer/foldscroll/foldscroll_producer.h
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,34 @@
 +/*
 + * USM patch 0006 — foldscroll:// producer.
 + *
@@ -355,8 +379,11 @@ index 00000000..e76e8816
 + *
 + * URI:   foldscroll://<channel>[-<layer>]
 + * Params: PW <panelWidth> PH <panelHeight> N <totalPanels> P <panelsPerRow>
-+ *         SPEED <pxPerFrame> DIR <1|-1>
-+ * Live retune via CALL: SPEED <pxPerFrame> | DIR <1|-1> | OFFSET <px>
++ *         SPEED <pxPerSecond> DIR <1|-1> [OFFSET <px>]
++ * Live retune via CALL: SPEED <pxPerSecond> | DIR <1|-1> | OFFSET <px>.
++ * Every CALL replies with the live offset (px), so `CALL <ch>-<layer> STATUS`
++ * reads it — used for seamless engine handover. The offset advances by
++ * measured wall-clock time (speed stays exact on free-running channels).
 + */
 +
 +#pragma once
