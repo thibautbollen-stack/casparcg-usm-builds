@@ -28,10 +28,10 @@ index e69f4b6c..1232bb8e 100644
  source_group(sources\\producer\\separated producer/separated/*)
 diff --git a/src/core/producer/foldscroll/foldscroll_producer.cpp b/src/core/producer/foldscroll/foldscroll_producer.cpp
 new file mode 100644
-index 00000000..796d1eee
+index 00000000..55091166
 --- /dev/null
 +++ b/src/core/producer/foldscroll/foldscroll_producer.cpp
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,425 @@
 +/*
 + * USM patch 0006 — foldscroll:// producer. See foldscroll_producer.h.
 + *
@@ -70,6 +70,11 @@ index 00000000..796d1eee
 +
 +namespace {
 +
++// FOLD-MATH-BEGIN — this block is pure std C++ (no CasparCG types) BY DESIGN:
++// test/foldscroll-oracle.test.mjs extracts it verbatim from the patch, wraps
++// it in a standalone main() and diffs it against the JS oracle
++// (scroll-slices.js computeScrollSlices) — keep it dependency-free.
++
 +constexpr double FS_EPS = 1e-6;
 +
 +// Positive modulo (matches scroll-slices.js `mod`).
@@ -78,10 +83,16 @@ index 00000000..796d1eee
 +// Closed-loop fold geometry — mirrors scroll-slices.js loopGeometry(). The app
 +// passes pw/ph/N and P (panelsPerRow, already floor(outputW/pw)-clamped); the
 +// producer derives the rest so the rows tile [0,T) exactly (Σ row_widths = T).
++// r6 — init_rw() takes an EXPLICIT per-row width list instead (variable-row
++// Free-grid screens): row_starts become the prefix sums and the locate in
++// compute_slices switches to a binary search. Without RW the fold is
++// byte-identical to r5.
 +struct fold_geometry
 +{
 +    int                 pw = 0, ph = 0, N = 0, P = 0, R = 0, L = 0;
 +    double              T = 0.0;
++    bool                variable  = false;
++    int                 guard_cap = 8; // uniform: ≤3 slices/row proven; 8 = paranoia
 +    std::vector<double> row_starts;
 +    std::vector<double> row_widths;
 +
@@ -100,6 +111,39 @@ index 00000000..796d1eee
 +            row_starts[r] = static_cast<double>(r) * P * pw;
 +            row_widths[r] = static_cast<double>((r == R - 1) ? L : P) * pw;
 +        }
++    }
++
++    // r6 — explicit per-row widths (validated positive by the caller). The
++    // derived pw-unit fields keep sane values for logging/state but the fold
++    // itself runs entirely on the arrays.
++    void init_rw(int pw_, int ph_, const std::vector<int>& widths)
++    {
++        pw = pw_;
++        ph = ph_;
++        R  = static_cast<int>(widths.size());
++        row_starts.assign(R, 0.0);
++        row_widths.assign(R, 0.0);
++        double acc  = 0.0;
++        int    maxw = 1;
++        for (int r = 0; r < R; ++r) {
++            row_starts[r] = acc;
++            row_widths[r] = static_cast<double>(widths[r]);
++            acc += widths[r];
++            maxw = std::max(maxw, widths[r]);
++        }
++        T        = acc;
++        N        = static_cast<int>(std::llround(acc / pw)); // strip length in panel units
++        P        = std::max(1, (maxw + pw - 1) / pw);        // widest row (info/log only)
++        L        = std::max(1, (widths[R - 1] + pw - 1) / pw);
++        variable = true;
++        // guard counts ITERATIONS, not emitted slices: an EPS-stall step
++        // (len ≤ FS_EPS) burns an iteration without emitting, so the walk's
++        // worst case is ~2R+1 iterations against ≤ R+1 real slices (a
++        // destination arc < T crosses each of the R seams at most once,
++        // +1 for the wrap re-entry). 2R+3 can therefore never truncate a
++        // legal fold; the app additionally refuses >3-slice shapes before
++        // ever arming the fold.
++        guard_cap = std::max(8, 2 * R + 3);
 +    }
 +
 +    bool valid() const { return pw > 0 && ph > 0 && N > 0 && P > 0 && T > 0.0; }
@@ -122,19 +166,29 @@ index 00000000..796d1eee
 +        double       x     = 0.0;
 +        int          guard = 0;
 +        while (x < w - FS_EPS) {
-+            const double u       = fs_mod(g.row_starts[r] + x - s, g.T);
-+            const int    src_row = std::min(g.R - 1, static_cast<int>(std::floor(u / row_span)));
-+            const double src_x   = u - g.row_starts[src_row];
-+            const double len     = std::min(w - x, g.row_widths[src_row] - src_x);
++            const double u = fs_mod(g.row_starts[r] + x - s, g.T);
++            int          src_row;
++            if (g.variable) {
++                // r6 — variable rows have no single span: last row_start ≤ u
++                // (u ∈ [0,T)), mirroring scroll-slices.js locate()'s bsearch.
++                auto it = std::upper_bound(g.row_starts.begin(), g.row_starts.end(), u);
++                src_row = std::max(0, std::min(g.R - 1, static_cast<int>(it - g.row_starts.begin()) - 1));
++            } else {
++                src_row = std::min(g.R - 1, static_cast<int>(std::floor(u / row_span)));
++            }
++            const double src_x = u - g.row_starts[src_row];
++            const double len   = std::min(w - x, g.row_widths[src_row] - src_x);
 +            if (len > FS_EPS)
 +                out.push_back(fold_slice{r, src_row, x, len, src_x});
 +            x += std::max(len, FS_EPS); // EPS floor — float noise must not stall the walk
-+            if (++guard > 8)            // ≤3 slices/row in exact math; 8 = paranoia
++            if (++guard > g.guard_cap)  // uniform: ≤3 proven; variable: R+2 hard cap
 +                break;
 +        }
 +    }
 +    return out;
 +}
++
++// FOLD-MATH-END
 +
 +} // namespace
 +
@@ -261,6 +315,9 @@ index 00000000..796d1eee
 +        core::monitor::state st;
 +        st["foldscroll/channel"] = source_channel_;
 +        st["foldscroll/rows"]    = geom_.R;
++        // r6 — runtime fingerprint: present (0/1) only on an RW-capable exe,
++        // so OSC-Diag can prove which bundle revision is actually running.
++        st["foldscroll/variable"] = geom_.variable ? 1 : 0;
 +        return st;
 +    }
 +
@@ -345,8 +402,49 @@ index 00000000..796d1eee
 +    const int pp = get_param(L"P", params, 0);
 +    if (pw <= 0 || ph <= 0 || n <= 0 || pp <= 0)
 +        CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"foldscroll: needs positive PW PH N P"));
-+    fold_geometry geom;
-+    geom.init(pw, ph, n, pp);
++
++    // r6 — optional RW <w0,w1,...>: explicit per-row pixel widths, comma-
++    // separated with NO spaces (survives AMCP whitespace tokenization).
++    // Present = variable-row fold (prefix-sum starts + bsearch locate);
++    // absent = the uniform r5 fold, byte-identical. Validation is LOUD:
++    // a malformed list or a sum that disagrees with N*PW fails the PLAY
++    // (user_error) instead of folding a wall wrongly — the app treats any
++    // non-404 refusal as transient and falls back to the tick engine.
++    const std::wstring rw = get_param(L"RW", params, std::wstring());
++    fold_geometry      geom;
++    if (!rw.empty()) {
++        std::vector<int> widths;
++        long long        sum = 0;
++        size_t           pos = 0;
++        while (pos <= rw.size()) {
++            size_t comma = rw.find(L',', pos);
++            if (comma == std::wstring::npos)
++                comma = rw.size();
++            int w = 0;
++            try {
++                const std::wstring tok  = rw.substr(pos, comma - pos);
++                size_t             used = 0;
++                w                       = std::stoi(tok, &used);
++                if (used != tok.size())
++                    w = 0; // trailing junk ("38abc", "10.5") — refuse, don't truncate
++            } catch (...) {
++                w = 0;
++            }
++            if (w <= 0)
++                CASPAR_THROW_EXCEPTION(user_error()
++                                       << msg_info(L"foldscroll: RW needs positive comma-separated widths"));
++            widths.push_back(w);
++            sum += w;
++            pos = comma + 1;
++        }
++        if (widths.empty() || widths.size() > 512)
++            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"foldscroll: RW row count out of range (1..512)"));
++        if (sum != static_cast<long long>(n) * pw)
++            CASPAR_THROW_EXCEPTION(user_error() << msg_info(L"foldscroll: RW widths must sum to N*PW"));
++        geom.init_rw(pw, ph, widths);
++    } else {
++        geom.init(pw, ph, n, pp);
++    }
 +
 +    const double speed   = std::abs(get_param(L"SPEED", params, 0.0)); // px per SECOND
 +    const int    dir     = get_param(L"DIR", params, 1) >= 0 ? 1 : -1;
@@ -361,10 +459,10 @@ index 00000000..796d1eee
 +}} // namespace caspar::core
 diff --git a/src/core/producer/foldscroll/foldscroll_producer.h b/src/core/producer/foldscroll/foldscroll_producer.h
 new file mode 100644
-index 00000000..27ec349c
+index 00000000..b14f32de
 --- /dev/null
 +++ b/src/core/producer/foldscroll/foldscroll_producer.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,36 @@
 +/*
 + * USM patch 0006 — foldscroll:// producer.
 + *
@@ -379,7 +477,9 @@ index 00000000..27ec349c
 + *
 + * URI:   foldscroll://<channel>[-<layer>]
 + * Params: PW <panelWidth> PH <panelHeight> N <totalPanels> P <panelsPerRow>
-+ *         SPEED <pxPerSecond> DIR <1|-1> [OFFSET <px>]
++ *         SPEED <pxPerSecond> DIR <1|-1> [OFFSET <px>] [RW <w0,w1,...>]
++ * RW (r6) = explicit per-row pixel widths (comma-separated, no spaces) for
++ * variable-row Free-grid screens; sum must equal N*PW. Absent = uniform fold.
 + * Live retune via CALL: SPEED <pxPerSecond> | DIR <1|-1> | OFFSET <px>.
 + * Every CALL replies with the live offset (px), so `CALL <ch>-<layer> STATUS`
 + * reads it — used for seamless engine handover. The offset advances by
