@@ -1,0 +1,129 @@
+--- a/src/modules/screen/consumer/screen_consumer.cpp
++++ b/src/modules/screen/consumer/screen_consumer.cpp
+@@ -52,6 +52,11 @@
+ 
+ #if defined(_MSC_VER)
+ #include <windows.h>
++// USM patch 0007 (screen-vsync-genlock): DwmFlush() blocks the calling thread until
++// the next DWM composition vblank — the pacing primitive for the genlock present loop
++// (wglSwapInterval / SFML vsync is cosmetic on the composited copy-path present).
++#include <dwmapi.h>
++#pragma comment(lib, "dwmapi.lib")
+ 
+ #pragma warning(push)
+ #pragma warning(disable : 4244)
+@@ -112,6 +117,7 @@ struct configuration
+     colour_spaces   colour_space  = colour_spaces::RGB;
+     bool            high_bitdepth = false;
+     bool            gpu_texture   = false;
++    bool            vsync_genlock = false; // USM patch 0007 (screen-vsync-genlock)
+ };
+ 
+ struct frame
+@@ -315,10 +321,16 @@ struct screen_consumer
+ 
+                 calculate_aspect();
+ 
+-                window_.setVerticalSyncEnabled(config_.vsync);
+-                if (config_.vsync) {
++                // USM patch 0007 (screen-vsync-genlock): in genlock mode DwmFlush() in
++                // tick() is the SOLE pacing clock, so keep SFML's swap-interval OFF to
++                // avoid a double vblank wait (which would halve the output rate).
++                window_.setVerticalSyncEnabled(config_.vsync && !config_.vsync_genlock);
++                if (config_.vsync && !config_.vsync_genlock) {
+                     CASPAR_LOG(info) << print() << " Enabled vsync.";
+                 }
++                if (config_.vsync_genlock) {
++                    CASPAR_LOG(info) << print() << " Enabled vsync-genlock (channel paced by DWM composition vblank).";
++                }
+ 
+                 shader_->set("colour_space", config_.colour_space);
+                 if (config_.colour_space == configuration::colour_spaces::datavideo_full ||
+@@ -382,6 +394,19 @@ struct screen_consumer
+ 
+         window_.display();
+ 
++#if defined(_MSC_VER)
++        // USM patch 0007 (screen-vsync-genlock): block until the next DWM composition so
++        // this tick loop — and therefore the whole channel, paced through
++        // has_synchronization_clock() — advances on the DISPLAY'S clock, not the free-
++        // running QPC softclock. On the windowed/borderless copy-path present (PresentMon
++        // "Composed: Copy with GPU GDI", SyncInterval=-1) DwmFlush() is the only primitive
++        // that aligns to when DWM actually samples our GL surface; collapses the QPC-vs-DWM
++        // beat (the ~48 fps / 40 ms-repeat straddle) back to a clean 50.0.
++        if (config_.vsync_genlock) {
++            DwmFlush();
++        }
++#endif
++
+         std::rotate(frames_.begin(), frames_.begin() + 1, frames_.end());
+ 
+         graph_->set_value("tick-time", tick_timer_.elapsed() * format_desc_.fps * 0.5);
+@@ -430,10 +455,22 @@ struct screen_consumer
+ 
+     std::future<bool> send(core::video_field field, const core::const_frame& frame)
+     {
+-        const int MAX_TRIES = 3;
++        // USM patch 0007 (screen-vsync-genlock): when genlock is on this consumer is the
++        // channel's synchronization clock (has_synchronization_clock()==true), so output.cpp
++        // skips its QPC sleep_until and the channel is paced ENTIRELY by how fast we drain
++        // frame_buffer_ — which the tick loop does once per real DWM vblank (DwmFlush). send()
++        // must therefore BLOCK until there is room instead of dropping, throttling the channel
++        // to the display = genlock. Bounded by a watchdog (~250 ms) so a stalled present
++        // thread can never WEDGE the channel (or a sibling consumer): on timeout we drop the
++        // frame. NOTE: a genuinely stalled present thread (e.g. DWM paused by an RDP/console
++        // switch) then pins the wall near-frozen — each send() waits the full ~250 ms then
++        // drops, so ~4 fps, NOT a smooth 50 fps free-run — which is acceptable because a
++        // paused DWM isn't compositing the wall anyway; it recovers once DWM resumes. (The
++        // 1 ms sleeps ride the process timer resolution, so "250 ms" is a floor, not exact.)
++        const int max_tries = config_.vsync_genlock ? 250 : 3;
+         int       count     = 0;
+         bool      delivered = false;
+-        while (count++ < MAX_TRIES && is_running_) {
++        while (count++ < max_tries && is_running_) {
+             if (frame_buffer_.try_push(frame)) {
+                 delivered = true;
+                 break;
+@@ -752,7 +789,14 @@ struct screen_consumer_proxy : public core::frame_consumer
+ 
+     std::wstring name() const override { return L"screen"; }
+ 
+-    bool has_synchronization_clock() const override { return false; }
++    // USM patch 0007 (screen-vsync-genlock): when genlock is enabled this consumer becomes
++    // the channel's sync clock, so output.cpp stops its QPC sleep_until pacing (output.cpp:
++    // needs_sync = ALL consumers have NO sync clock) and the channel is instead paced by our
++    // vblank-blocked send(). Off ⇒ upstream behaviour (false). ASSUMES the screen consumer is
++    // the sole/primary consumer on its channel — do NOT combine genlock with another
++    // sync-clock consumer (e.g. a DeckLink genlock) on the same channel, or neither the QPC
++    // clock nor a single clean master paces it. (USM's generated configs emit only <screen>.)
++    bool has_synchronization_clock() const override { return config_.vsync_genlock; }
+ 
+     int index() const override { return 600 + (config_.key_only ? 10 : 0) + config_.screen_index; }
+ 
+@@ -787,8 +831,11 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
+         }
+     }
+ 
+-    config.windowed    = !contains_param(L"FULLSCREEN", params);
+-    config.gpu_texture = contains_param(L"GPU", params);
++    config.windowed      = !contains_param(L"FULLSCREEN", params);
++    config.gpu_texture   = contains_param(L"GPU", params);
++#if defined(_MSC_VER)
++    config.vsync_genlock = contains_param(L"GENLOCK", params); // USM patch 0007 — Windows only (needs DwmFlush)
++#endif
+     config.key_only    = contains_param(L"KEY_ONLY", params);
+     config.sbs_key     = contains_param(L"SBS_KEY", params);
+     config.interactive = !contains_param(L"NON_INTERACTIVE", params);
+@@ -843,6 +890,12 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
+     config.borderless    = ptree.get(L"borderless", config.borderless);
+     config.always_on_top = ptree.get(L"always-on-top", config.always_on_top);
+     config.gpu_texture   = ptree.get(L"gpu-texture", config.gpu_texture);
++#if defined(_MSC_VER)
++    // USM patch 0007 (screen-vsync-genlock): parsed ONLY on MSVC — genlock needs DwmFlush()
++    // (Windows), so on any other platform the flag stays false and every genlock code path
++    // below is dead (no clockless free-run possible).
++    config.vsync_genlock = ptree.get(L"vsync-genlock", config.vsync_genlock);
++#endif
+ 
+     auto colour_space_value = ptree.get(L"colour-space", L"RGB");
+     config.colour_space     = configuration::colour_spaces::RGB;
