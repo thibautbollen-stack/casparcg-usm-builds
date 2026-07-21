@@ -139,7 +139,7 @@
              } else if (e.type == sf::Event::Closed) {
                  is_running_ = false;
              }
-@@ -444,18 +524,277 @@ struct screen_consumer
+@@ -444,18 +524,282 @@ struct screen_consumer
      // faster display and overclock the channel — worst case it degrades to a plain 50 Hz clock.
      void genlock_fallback_pace()
      {
@@ -391,7 +391,12 @@
 +            if (ok) {
 +                flip_locked_ = true;
 +                glBindFramebuffer(GL_FRAMEBUFFER, flip_fbo_);
++                // GL's framebuffer origin is BOTTOM-left; D3D textures are TOP-left. Without
++                // this the presented image is vertically mirrored (rig-observed: wall upside
++                // down). glClipControl is core GL 4.5, which CasparCG already requires.
++                glClipControl(GL_UPPER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
 +                strategy_->do_tick(this);
++                glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
 +                glBindFramebuffer(GL_FRAMEBUFFER, 0);
 +                usm_wglDXUnlockObjectsNV_(flip_interop_device_, 1, &flip_interop_object_);
 +                flip_locked_ = false;
@@ -419,7 +424,7 @@
          strategy_->do_tick(this);
  
          window_.display();
-@@ -467,7 +806,13 @@ struct screen_consumer
+@@ -467,7 +811,13 @@ struct screen_consumer
          // Uses IDXGIOutput::WaitForVBlank on the bound output (NOT DwmFlush, whose global
          // composition clock follows the primary/fastest display and overclocked the channel to
          // ~150 fps on a multi-monitor rig). Fallback caps to the channel rate — never overclocks.
@@ -434,7 +439,7 @@
              if (genlock_output_) {
                  genlock_output_->WaitForVBlank();
              } else {
-@@ -536,7 +881,10 @@ struct screen_consumer
+@@ -536,7 +886,10 @@ struct screen_consumer
          // drops, so ~4 fps, NOT a smooth 50 fps free-run — which is acceptable because a
          // paused DWM isn't compositing the wall anyway; it recovers once DWM resumes. (The
          // 1 ms sleeps ride the process timer resolution, so "250 ms" is a floor, not exact.)
@@ -446,7 +451,7 @@
          int       count     = 0;
          bool      delivered = false;
          while (count++ < max_tries && is_running_) {
-@@ -865,7 +1213,10 @@ struct screen_consumer_proxy : public core::frame_consumer
+@@ -865,7 +1218,10 @@ struct screen_consumer_proxy : public core::frame_consumer
      // the sole/primary consumer on its channel — do NOT combine genlock with another
      // sync-clock consumer (e.g. a DeckLink genlock) on the same channel, or neither the QPC
      // clock nor a single clean master paces it. (USM's generated configs emit only <screen>.)
@@ -458,7 +463,7 @@
  
      int index() const override { return 600 + (config_.key_only ? 10 : 0) + config_.screen_index; }
  
-@@ -904,6 +1255,7 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
+@@ -904,6 +1260,7 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
      config.gpu_texture   = contains_param(L"GPU", params);
  #if defined(_MSC_VER)
      config.vsync_genlock = contains_param(L"GENLOCK", params); // USM patch 0007 — Windows only (needs DwmFlush)
@@ -466,7 +471,7 @@
  #endif
      config.key_only    = contains_param(L"KEY_ONLY", params);
      config.sbs_key     = contains_param(L"SBS_KEY", params);
-@@ -964,6 +1316,9 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
+@@ -964,6 +1321,9 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
      // (Windows), so on any other platform the flag stays false and every genlock code path
      // below is dead (no clockless free-run possible).
      config.vsync_genlock = ptree.get(L"vsync-genlock", config.vsync_genlock);
