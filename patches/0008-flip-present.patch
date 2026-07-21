@@ -1,0 +1,478 @@
+--- a/src/modules/screen/consumer/screen_consumer.cpp
++++ b/src/modules/screen/consumer/screen_consumer.cpp
+@@ -60,6 +60,28 @@
+ #include <dxgi.h>
+ #include <wrl/client.h>
+ #pragma comment(lib, "dxgi.lib")
++// USM patch 0008 (flip-present): render into a D3D11 texture via WGL_NV_DX_interop2 and
++// Present() it on a DXGI FLIP-model swapchain, so DWM *flips* our buffer instead of
++// copy-sampling the GL window (`Composed: Copy with GPU GDI` — measured 2026-07-21 to
++// jitter ±3 ms and drop ~3-4% of frames even at idle, independent of content/pacing).
++#include <d3d11.h>
++#include <dxgi1_2.h>
++#pragma comment(lib, "d3d11.lib")
++#pragma comment(lib, "opengl32.lib") // wglGetProcAddress — first direct GL import in this file
++
++// WGL_NV_DX_interop2 entry points, loaded at runtime via wglGetProcAddress. Deliberately
++// USM-prefixed typedef/constant names so nothing collides if wglew.h ever gets included.
++typedef HANDLE(WINAPI* USM_PFN_wglDXOpenDeviceNV)(void* dxDevice);
++typedef BOOL(WINAPI* USM_PFN_wglDXCloseDeviceNV)(HANDLE hDevice);
++typedef HANDLE(WINAPI* USM_PFN_wglDXRegisterObjectNV)(HANDLE hDevice,
++                                                      void*  dxObject,
++                                                      GLuint name,
++                                                      GLenum type,
++                                                      GLenum access);
++typedef BOOL(WINAPI* USM_PFN_wglDXUnregisterObjectNV)(HANDLE hDevice, HANDLE hObject);
++typedef BOOL(WINAPI* USM_PFN_wglDXLockObjectsNV)(HANDLE hDevice, GLint count, HANDLE* hObjects);
++typedef BOOL(WINAPI* USM_PFN_wglDXUnlockObjectsNV)(HANDLE hDevice, GLint count, HANDLE* hObjects);
++#define USM_WGL_ACCESS_READ_WRITE_NV 0x0001
+ 
+ #pragma warning(push)
+ #pragma warning(disable : 4244)
+@@ -121,6 +143,7 @@ struct configuration
+     bool            high_bitdepth = false;
+     bool            gpu_texture   = false;
+     bool            vsync_genlock = false; // USM patch 0007 (screen-vsync-genlock)
++    bool            flip_present  = false; // USM patch 0008 (flip-present)
+ };
+ 
+ struct frame
+@@ -182,6 +205,36 @@ struct screen_consumer
+     // Fallback rate-cap deadline used only when no DXGI output matches the window monitor —
+     // caps the tick loop to the channel rate so it can never overclock even without a vblank.
+     std::chrono::high_resolution_clock::time_point genlock_deadline_{};
++
++    // USM patch 0008 (flip-present): DXGI flip-model present state. flip_active_ is true only
++    // after EVERY init step succeeded; any failure (extension missing, device/swapchain/interop
++    // error, mid-stream Present failure, window resize) tears down and PERMANENTLY falls back to
++    // the plain SwapBuffers path for this consumer instance — rate-capped so it can never
++    // overclock — i.e. worst case is exactly the pre-0008 behaviour.
++    bool                                       flip_active_ = false;
++    // Set by poll() on a resize INSTEAD of tearing down inline: poll() runs inside
++    // do_tick — i.e. between wglDXLockObjectsNV and the unlock — and a teardown there
++    // would unregister a locked object, delete the bound FBO and null the swapchain the
++    // enclosing tick is about to Present (guaranteed crash). tick() acts on the flag
++    // BEFORE taking the lock.
++    bool                                       flip_teardown_pending_ = false;
++    // True while the interop object is locked; teardown unlocks first if needed so an
++    // exception-path teardown never unregisters a locked object (NV spec violation).
++    bool                                       flip_locked_ = false;
++    Microsoft::WRL::ComPtr<ID3D11Device>       flip_device_;
++    Microsoft::WRL::ComPtr<ID3D11DeviceContext> flip_context_;
++    Microsoft::WRL::ComPtr<IDXGISwapChain1>    flip_swapchain_;
++    Microsoft::WRL::ComPtr<ID3D11Texture2D>    flip_texture_;
++    HANDLE                                     flip_interop_device_ = nullptr;
++    HANDLE                                     flip_interop_object_ = nullptr;
++    GLuint                                     flip_gl_texture_     = 0;
++    GLuint                                     flip_fbo_            = 0;
++    USM_PFN_wglDXOpenDeviceNV       usm_wglDXOpenDeviceNV_       = nullptr;
++    USM_PFN_wglDXCloseDeviceNV      usm_wglDXCloseDeviceNV_      = nullptr;
++    USM_PFN_wglDXRegisterObjectNV   usm_wglDXRegisterObjectNV_   = nullptr;
++    USM_PFN_wglDXUnregisterObjectNV usm_wglDXUnregisterObjectNV_ = nullptr;
++    USM_PFN_wglDXLockObjectsNV      usm_wglDXLockObjectsNV_      = nullptr;
++    USM_PFN_wglDXUnlockObjectsNV    usm_wglDXUnlockObjectsNV_    = nullptr;
+ #endif
+ 
+     spl::shared_ptr<display_strategy> strategy_;
+@@ -333,11 +386,14 @@ struct screen_consumer
+ 
+                 calculate_aspect();
+ 
+-                // USM patch 0007 (screen-vsync-genlock): in genlock mode DwmFlush() in
+-                // tick() is the SOLE pacing clock, so keep SFML's swap-interval OFF to
+-                // avoid a double vblank wait (which would halve the output rate).
+-                window_.setVerticalSyncEnabled(config_.vsync && !config_.vsync_genlock);
+-                if (config_.vsync && !config_.vsync_genlock) {
++                // USM patch 0007 (screen-vsync-genlock): in genlock mode the tick() wait is
++                // the SOLE pacing clock, so keep SFML's swap-interval OFF to avoid a double
++                // vblank wait (which would halve the output rate). USM patch 0008: same for
++                // flip-present — its windowed FALLBACK path carries its own pacing wait, and
++                // a vsynced SwapBuffers on top would beat against it (audit M3).
++                const bool sfml_vsync = config_.vsync && !config_.vsync_genlock && !config_.flip_present;
++                window_.setVerticalSyncEnabled(sfml_vsync);
++                if (sfml_vsync) {
+                     CASPAR_LOG(info) << print() << " Enabled vsync.";
+                 }
+                 // vsync-genlock is logged from acquire_genlock_output() below, once the LED
+@@ -361,6 +417,12 @@ struct screen_consumer
+                 if (config_.vsync_genlock) {
+                     acquire_genlock_output();
+                 }
++                // USM patch 0008 (flip-present): bring up the DXGI flip-model present path.
++                // Every failure inside is non-fatal — flip_active_ stays false and tick()
++                // uses the plain (rate-capped) SwapBuffers path, i.e. pre-0008 behaviour.
++                if (config_.flip_present) {
++                    flip_init();
++                }
+ #endif
+ 
+                 while (is_running_) {
+@@ -377,6 +439,12 @@ struct screen_consumer
+                 strategy_->cleanup_frame(frame);
+             }
+ 
++#if defined(_MSC_VER)
++            // USM patch 0008 (flip-present): interop unregister needs the live GL context,
++            // so teardown MUST happen on this thread before the window closes.
++            flip_teardown();
++#endif
++
+             shader_.reset();
+             GL(glDeleteVertexArrays(1, &vao_));
+             GL(glDeleteBuffers(1, &vbo_));
+@@ -400,6 +468,18 @@ struct screen_consumer
+             count++;
+             if (e.type == sf::Event::Resized) {
+                 calculate_aspect();
++#if defined(_MSC_VER)
++                // USM patch 0008 (flip-present): the interop texture/swapchain are sized at
++                // init; a resized window would present a stale-sized buffer. LED windows are
++                // fixed-bounds in production, so drop to the SwapBuffers fallback — but only
++                // DEFER it: poll() runs inside the locked flip tick (do_tick pumps events),
++                // so an inline teardown here would crash the enclosing tick (audit B1).
++                if (flip_active_ && !flip_teardown_pending_) {
++                    CASPAR_LOG(warning) << print()
++                                        << L" flip-present: window resized — falling back to windowed present.";
++                    flip_teardown_pending_ = true;
++                }
++#endif
+             } else if (e.type == sf::Event::Closed) {
+                 is_running_ = false;
+             }
+@@ -444,18 +524,277 @@ struct screen_consumer
+     // faster display and overclock the channel — worst case it degrades to a plain 50 Hz clock.
+     void genlock_fallback_pace()
+     {
+-        const auto now    = std::chrono::high_resolution_clock::now();
+-        const auto period = std::chrono::microseconds(static_cast<int>(1e6 / format_desc_.hz));
++        const auto now = std::chrono::high_resolution_clock::now();
++        // USM patch 0008 (audit M5): output.cpp sends field_count frames per 1/hz channel
++        // tick, so this pop-side pace must allow field_count pops per tick or an interlaced
++        // channel's queue would permanently overflow (every send burning the full watchdog).
++        // Progressive (field_count 1) is unchanged.
++        const int  fields = format_desc_.field_count == 2 ? 2 : 1;
++        const auto period = std::chrono::microseconds(static_cast<int>(1e6 / (format_desc_.hz * fields)));
+         if (genlock_deadline_.time_since_epoch().count() == 0 || genlock_deadline_ < now) {
+             genlock_deadline_ = now;
+         }
+         genlock_deadline_ += period;
+         std::this_thread::sleep_until(genlock_deadline_);
+     }
++
++    // ─── USM patch 0008 (flip-present) ────────────────────────────────────────────
++    //
++    // Windowed GL presents through DWM's `Composed: Copy with GPU GDI` path: DWM
++    // re-samples the window surface on its own composition schedule, which was
++    // measured (PresentMon, 2026-07-21) to add ±3 ms present wobble and ~3-4%
++    // doubled frames even on an idle test pattern — unfixable by pacing the
++    // producer (QPC/DwmFlush/WaitForVBlank all tried). Flip model hands DWM our
++    // buffer to FLIP instead of copy: GL renders into a D3D11 texture shared via
++    // WGL_NV_DX_interop2, which is copied to a DXGI FLIP_DISCARD swapchain and
++    // Present(1)'d. Every failure at ANY point falls back permanently (for this
++    // consumer instance) to the plain SwapBuffers path — worst case is exactly
++    // the pre-0008 behaviour, never a black screen.
++
++    // The flip path calls GL entry points RAW (never via the throwing GL() macro — a
++    // flip failure must degrade, not kill the consumer). Raw calls can leave error
++    // flags set that the NEXT GL()-wrapped call in the strategies would then throw
++    // on spuriously, so drain the error queue at every flip boundary.
++    static void flip_drain_gl_errors()
++    {
++        for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {
++        }
++    }
++
++    void flip_init()
++    {
++        const auto fail = [this](const wchar_t* what) {
++            CASPAR_LOG(warning) << print() << L" flip-present: " << what
++                                << L" — using windowed present (rate-capped) instead.";
++            flip_teardown();
++            flip_drain_gl_errors();
++        };
++
++        usm_wglDXOpenDeviceNV_ =
++            reinterpret_cast<USM_PFN_wglDXOpenDeviceNV>(wglGetProcAddress("wglDXOpenDeviceNV"));
++        usm_wglDXCloseDeviceNV_ =
++            reinterpret_cast<USM_PFN_wglDXCloseDeviceNV>(wglGetProcAddress("wglDXCloseDeviceNV"));
++        usm_wglDXRegisterObjectNV_ =
++            reinterpret_cast<USM_PFN_wglDXRegisterObjectNV>(wglGetProcAddress("wglDXRegisterObjectNV"));
++        usm_wglDXUnregisterObjectNV_ =
++            reinterpret_cast<USM_PFN_wglDXUnregisterObjectNV>(wglGetProcAddress("wglDXUnregisterObjectNV"));
++        usm_wglDXLockObjectsNV_ =
++            reinterpret_cast<USM_PFN_wglDXLockObjectsNV>(wglGetProcAddress("wglDXLockObjectsNV"));
++        usm_wglDXUnlockObjectsNV_ =
++            reinterpret_cast<USM_PFN_wglDXUnlockObjectsNV>(wglGetProcAddress("wglDXUnlockObjectsNV"));
++        if (!usm_wglDXOpenDeviceNV_ || !usm_wglDXCloseDeviceNV_ || !usm_wglDXRegisterObjectNV_ ||
++            !usm_wglDXUnregisterObjectNV_ || !usm_wglDXLockObjectsNV_ || !usm_wglDXUnlockObjectsNV_) {
++            return fail(L"WGL_NV_DX_interop2 not available on this driver");
++        }
++
++        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
++        if (FAILED(D3D11CreateDevice(nullptr,
++                                     D3D_DRIVER_TYPE_HARDWARE,
++                                     nullptr,
++                                     flags,
++                                     nullptr,
++                                     0,
++                                     D3D11_SDK_VERSION,
++                                     flip_device_.GetAddressOf(),
++                                     nullptr,
++                                     flip_context_.GetAddressOf()))) {
++            return fail(L"D3D11CreateDevice failed");
++        }
++
++        Microsoft::WRL::ComPtr<IDXGIDevice1> dxgi_device;
++        if (FAILED(flip_device_.As(&dxgi_device))) {
++            return fail(L"IDXGIDevice1 unavailable");
++        }
++        dxgi_device->SetMaximumFrameLatency(1);
++
++        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
++        Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
++        if (FAILED(dxgi_device->GetAdapter(adapter.GetAddressOf())) ||
++            FAILED(adapter->GetParent(IID_PPV_ARGS(factory.GetAddressOf())))) {
++            return fail(L"DXGI factory unavailable");
++        }
++
++        HWND hwnd = static_cast<HWND>(window_.getSystemHandle());
++
++        DXGI_SWAP_CHAIN_DESC1 sc = {};
++        sc.Width              = static_cast<UINT>(screen_width_);
++        sc.Height             = static_cast<UINT>(screen_height_);
++        sc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
++        sc.SampleDesc.Count   = 1;
++        sc.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++        sc.BufferCount        = 2;
++        sc.SwapEffect         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++        sc.AlphaMode          = DXGI_ALPHA_MODE_IGNORE;
++        sc.Scaling            = DXGI_SCALING_STRETCH;
++        if (FAILED(factory->CreateSwapChainForHwnd(
++                flip_device_.Get(), hwnd, &sc, nullptr, nullptr, flip_swapchain_.GetAddressOf()))) {
++            return fail(L"CreateSwapChainForHwnd (flip model) failed");
++        }
++        factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
++
++        // GL renders into THIS texture (via interop); each tick it is copied onto the
++        // swapchain's current backbuffer. The copy sidesteps flip-model backbuffer
++        // rotation, which interop registration does not follow.
++        D3D11_TEXTURE2D_DESC td = {};
++        td.Width            = static_cast<UINT>(screen_width_);
++        td.Height           = static_cast<UINT>(screen_height_);
++        td.MipLevels        = 1;
++        td.ArraySize        = 1;
++        td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage            = D3D11_USAGE_DEFAULT;
++        td.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++        if (FAILED(flip_device_->CreateTexture2D(&td, nullptr, flip_texture_.GetAddressOf()))) {
++            return fail(L"shared texture creation failed");
++        }
++
++        flip_interop_device_ = usm_wglDXOpenDeviceNV_(flip_device_.Get());
++        if (!flip_interop_device_) {
++            return fail(L"wglDXOpenDeviceNV failed");
++        }
++
++        glGenTextures(1, &flip_gl_texture_);
++        flip_interop_object_ = usm_wglDXRegisterObjectNV_(flip_interop_device_,
++                                                          flip_texture_.Get(),
++                                                          flip_gl_texture_,
++                                                          GL_TEXTURE_2D,
++                                                          USM_WGL_ACCESS_READ_WRITE_NV);
++        if (!flip_interop_object_) {
++            return fail(L"wglDXRegisterObjectNV failed");
++        }
++
++        glGenFramebuffers(1, &flip_fbo_);
++        if (!usm_wglDXLockObjectsNV_(flip_interop_device_, 1, &flip_interop_object_)) {
++            return fail(L"wglDXLockObjectsNV failed");
++        }
++        glBindFramebuffer(GL_FRAMEBUFFER, flip_fbo_);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, flip_gl_texture_, 0);
++        const GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        usm_wglDXUnlockObjectsNV_(flip_interop_device_, 1, &flip_interop_object_);
++        if (fbo_status != GL_FRAMEBUFFER_COMPLETE) {
++            return fail(L"interop framebuffer incomplete");
++        }
++
++        flip_drain_gl_errors();
++        flip_active_ = true;
++        CASPAR_LOG(info) << print() << L" Enabled flip-present (DXGI flip-model — off the DWM copy path).";
++    }
++
++    void flip_teardown()
++    {
++        flip_active_          = false;
++        flip_teardown_pending_ = false;
++        // Audit M4: an exception-path teardown can arrive with the interop object still
++        // locked (do_tick threw between lock and unlock) — unregistering a locked object
++        // is undefined per the NV interop spec, so unlock first.
++        if (flip_locked_ && flip_interop_object_ && flip_interop_device_ && usm_wglDXUnlockObjectsNV_) {
++            usm_wglDXUnlockObjectsNV_(flip_interop_device_, 1, &flip_interop_object_);
++        }
++        flip_locked_ = false;
++        if (flip_interop_object_ && flip_interop_device_ && usm_wglDXUnregisterObjectNV_) {
++            usm_wglDXUnregisterObjectNV_(flip_interop_device_, flip_interop_object_);
++        }
++        flip_interop_object_ = nullptr;
++        if (flip_interop_device_ && usm_wglDXCloseDeviceNV_) {
++            usm_wglDXCloseDeviceNV_(flip_interop_device_);
++        }
++        flip_interop_device_ = nullptr;
++        if (flip_fbo_) {
++            glDeleteFramebuffers(1, &flip_fbo_);
++            flip_fbo_ = 0;
++        }
++        if (flip_gl_texture_) {
++            glDeleteTextures(1, &flip_gl_texture_);
++            flip_gl_texture_ = 0;
++        }
++        flip_texture_.Reset();
++        flip_swapchain_.Reset();
++        flip_context_.Reset();
++        flip_device_.Reset();
++        flip_drain_gl_errors();
++    }
++
++    // Audit H2: after a MID-SHOW teardown DWM may keep showing the retired swapchain
++    // surface instead of the window's redirection surface the resumed SwapBuffers path
++    // draws into (mixing presentation models on one HWND is driver-dependent). Nudge the
++    // window so DWM rebuilds its composition state; the next GL frame then shows.
++    void flip_restore_window_present()
++    {
++        HWND hwnd = static_cast<HWND>(window_.getSystemHandle());
++        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
++                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
++        InvalidateRect(hwnd, nullptr, TRUE);
++    }
++
++    // One genuine flip-model present: copy the interop texture onto the current
++    // backbuffer and Present(1). Returns false on failure — caller tears down and
++    // falls back. DXGI_STATUS_OCCLUDED (window hidden) is SUCCESS but does not
++    // vblank-block, so rate-cap that tick to avoid a runaway channel.
++    bool flip_present_frame()
++    {
++        Microsoft::WRL::ComPtr<ID3D11Texture2D> backbuffer;
++        if (FAILED(flip_swapchain_->GetBuffer(0, IID_PPV_ARGS(backbuffer.GetAddressOf())))) {
++            return false;
++        }
++        flip_context_->CopyResource(backbuffer.Get(), flip_texture_.Get());
++        const HRESULT hr = flip_swapchain_->Present(1, 0);
++        if (FAILED(hr)) {
++            return false;
++        }
++        if (hr == DXGI_STATUS_OCCLUDED) {
++            genlock_fallback_pace();
++        }
++        return true;
++    }
+ #endif
+ 
+     void tick()
+     {
++#if defined(_MSC_VER)
++        // USM patch 0008 (flip-present, audit B1): a resize seen by poll() inside a
++        // previous locked tick only FLAGS the teardown — act on it here, outside any
++        // lock, before this tick chooses a path.
++        if (flip_teardown_pending_) {
++            flip_teardown();
++            flip_restore_window_present();
++        }
++
++        // USM patch 0008 (flip-present): render this tick into the interop FBO and
++        // Present(1) it on the flip swapchain instead of SwapBuffers. Present with
++        // MaximumFrameLatency(1) blocks on the display's real cadence, so it is ALSO
++        // the pacing wait (no extra genlock wait needed on this path). Any failure
++        // tears down and this very tick falls through to the windowed path below.
++        if (flip_active_) {
++            bool ok = usm_wglDXLockObjectsNV_(flip_interop_device_, 1, &flip_interop_object_) != 0;
++            if (ok) {
++                flip_locked_ = true;
++                glBindFramebuffer(GL_FRAMEBUFFER, flip_fbo_);
++                strategy_->do_tick(this);
++                glBindFramebuffer(GL_FRAMEBUFFER, 0);
++                usm_wglDXUnlockObjectsNV_(flip_interop_device_, 1, &flip_interop_object_);
++                flip_locked_ = false;
++                // poll() inside do_tick may have flagged a resize; present this last
++                // (correctly rendered) frame only if the flip state is staying up.
++                ok = flip_teardown_pending_ ? true : flip_present_frame();
++            }
++            if (!ok) {
++                CASPAR_LOG(warning) << print()
++                                    << L" flip-present: present failed — falling back to windowed present.";
++                flip_teardown();
++                flip_restore_window_present();
++                // Fall through to the windowed path. NOTE (audit L7): the frame this tick
++                // already consumed is skipped — the windowed do_tick below blocks for the
++                // NEXT frame, so the switchover costs exactly one frame (~2 tick periods).
++            } else {
++                std::rotate(frames_.begin(), frames_.begin() + 1, frames_.end());
++                graph_->set_value("tick-time", tick_timer_.elapsed() * format_desc_.fps * 0.5);
++                tick_timer_.restart();
++                return;
++            }
++        }
++#endif
++
+         strategy_->do_tick(this);
+ 
+         window_.display();
+@@ -467,7 +806,13 @@ struct screen_consumer
+         // Uses IDXGIOutput::WaitForVBlank on the bound output (NOT DwmFlush, whose global
+         // composition clock follows the primary/fastest display and overclocked the channel to
+         // ~150 fps on a multi-monitor rig). Fallback caps to the channel rate — never overclocks.
+-        if (config_.vsync_genlock) {
++        //
++        // USM patch 0008: when flip-present was REQUESTED (config flag on) but is not active
++        // (init failed or torn down), the channel may still be paced through send() blocking
++        // (has_synchronization_clock() is true for flip mode too) — so this windowed path MUST
++        // carry a pacing wait or the un-vsynced SwapBuffers would free-run and OVERCLOCK the
++        // channel. WaitForVBlank if genlock bound one, else the drift-free rate cap.
++        if (config_.vsync_genlock || config_.flip_present) {
+             if (genlock_output_) {
+                 genlock_output_->WaitForVBlank();
+             } else {
+@@ -536,7 +881,10 @@ struct screen_consumer
+         // drops, so ~4 fps, NOT a smooth 50 fps free-run — which is acceptable because a
+         // paused DWM isn't compositing the wall anyway; it recovers once DWM resumes. (The
+         // 1 ms sleeps ride the process timer resolution, so "250 ms" is a floor, not exact.)
+-        const int max_tries = config_.vsync_genlock ? 250 : 3;
++        // USM patch 0008: flip-present paces the channel exactly like genlock (blocking
++        // send, present thread on the display clock via Present(1)/rate-cap), so it gets
++        // the same bounded-blocking push.
++        const int max_tries = (config_.vsync_genlock || config_.flip_present) ? 250 : 3;
+         int       count     = 0;
+         bool      delivered = false;
+         while (count++ < max_tries && is_running_) {
+@@ -865,7 +1213,10 @@ struct screen_consumer_proxy : public core::frame_consumer
+     // the sole/primary consumer on its channel — do NOT combine genlock with another
+     // sync-clock consumer (e.g. a DeckLink genlock) on the same channel, or neither the QPC
+     // clock nor a single clean master paces it. (USM's generated configs emit only <screen>.)
+-    bool has_synchronization_clock() const override { return config_.vsync_genlock; }
++    // USM patch 0008: flip-present also makes this consumer the channel's sync clock —
++    // the channel is paced by the blocking send() against the Present(1)-timed (or
++    // rate-capped fallback) tick loop, so it can never outrun or beat the display.
++    bool has_synchronization_clock() const override { return config_.vsync_genlock || config_.flip_present; }
+ 
+     int index() const override { return 600 + (config_.key_only ? 10 : 0) + config_.screen_index; }
+ 
+@@ -904,6 +1255,7 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
+     config.gpu_texture   = contains_param(L"GPU", params);
+ #if defined(_MSC_VER)
+     config.vsync_genlock = contains_param(L"GENLOCK", params); // USM patch 0007 — Windows only (needs DwmFlush)
++    config.flip_present  = contains_param(L"FLIP", params);    // USM patch 0008 — Windows only (DXGI)
+ #endif
+     config.key_only    = contains_param(L"KEY_ONLY", params);
+     config.sbs_key     = contains_param(L"SBS_KEY", params);
+@@ -964,6 +1316,9 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
+     // (Windows), so on any other platform the flag stays false and every genlock code path
+     // below is dead (no clockless free-run possible).
+     config.vsync_genlock = ptree.get(L"vsync-genlock", config.vsync_genlock);
++    // USM patch 0008 (flip-present): parsed ONLY on MSVC — needs D3D11/DXGI; on any other
++    // platform the flag stays false and every flip code path above is dead.
++    config.flip_present  = ptree.get(L"flip-present", config.flip_present);
+ #endif
+ 
+     auto colour_space_value = ptree.get(L"colour-space", L"RGB");
