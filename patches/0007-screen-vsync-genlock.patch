@@ -1,18 +1,27 @@
 --- a/src/modules/screen/consumer/screen_consumer.cpp
 +++ b/src/modules/screen/consumer/screen_consumer.cpp
-@@ -52,6 +52,11 @@
+@@ -46,12 +46,20 @@
+ 
+ #include <tbb/concurrent_queue.h>
+ 
++#include <chrono>
+ #include <thread>
+ #include <utility>
+ #include <vector>
  
  #if defined(_MSC_VER)
  #include <windows.h>
-+// USM patch 0007 (screen-vsync-genlock): DwmFlush() blocks the calling thread until
-+// the next DWM composition vblank — the pacing primitive for the genlock present loop
-+// (wglSwapInterval / SFML vsync is cosmetic on the composited copy-path present).
-+#include <dwmapi.h>
-+#pragma comment(lib, "dwmapi.lib")
++// USM patch 0007 (screen-vsync-genlock): genlock the channel to the LED output monitor's
++// OWN vblank via IDXGIOutput::WaitForVBlank — NOT DwmFlush(), whose global DWM composition
++// clock follows the primary/fastest display and overclocks the channel on a multi-monitor
++// rig (2026-07-21: a 50 Hz channel driven to ~150 fps by a fast operator monitor).
++#include <dxgi.h>
++#include <wrl/client.h>
++#pragma comment(lib, "dxgi.lib")
  
  #pragma warning(push)
  #pragma warning(disable : 4244)
-@@ -112,6 +117,7 @@ struct configuration
+@@ -112,6 +120,7 @@ struct configuration
      colour_spaces   colour_space  = colour_spaces::RGB;
      bool            high_bitdepth = false;
      bool            gpu_texture   = false;
@@ -20,7 +29,23 @@
  };
  
  struct frame
-@@ -315,10 +321,16 @@ struct screen_consumer
+@@ -165,6 +174,15 @@ struct screen_consumer
+ 
+     std::atomic<bool> is_running_{true};
+     std::thread       thread_;
++#if defined(_MSC_VER)
++    // USM patch 0007 (screen-vsync-genlock): the LED monitor's own vblank source. When bound,
++    // tick() waits on THIS output's vblank (WaitForVBlank) to pace the channel to the LED
++    // monitor's true refresh — not DwmFlush()'s global/primary composition clock.
++    Microsoft::WRL::ComPtr<IDXGIOutput> genlock_output_;
++    // Fallback rate-cap deadline used only when no DXGI output matches the window monitor —
++    // caps the tick loop to the channel rate so it can never overclock even without a vblank.
++    std::chrono::high_resolution_clock::time_point genlock_deadline_{};
++#endif
+ 
+     spl::shared_ptr<display_strategy> strategy_;
+ 
+@@ -315,10 +333,15 @@ struct screen_consumer
  
                  calculate_aspect();
  
@@ -33,33 +58,103 @@
 +                if (config_.vsync && !config_.vsync_genlock) {
                      CASPAR_LOG(info) << print() << " Enabled vsync.";
                  }
-+                if (config_.vsync_genlock) {
-+                    CASPAR_LOG(info) << print() << " Enabled vsync-genlock (channel paced by DWM composition vblank).";
-+                }
++                // vsync-genlock is logged from acquire_genlock_output() below, once the LED
++                // output's vblank source is actually bound (or the fallback is chosen).
  
                  shader_->set("colour_space", config_.colour_space);
                  if (config_.colour_space == configuration::colour_spaces::datavideo_full ||
-@@ -382,6 +394,19 @@ struct screen_consumer
+@@ -332,6 +355,14 @@ struct screen_consumer
+                 glClear(GL_COLOR_BUFFER_BIT);
+                 window_.display();
+ 
++#if defined(_MSC_VER)
++                // USM patch 0007 (screen-vsync-genlock): bind the LED output's vblank source
++                // now that the window exists and is positioned on its monitor.
++                if (config_.vsync_genlock) {
++                    acquire_genlock_output();
++                }
++#endif
++
+                 while (is_running_) {
+                     tick();
+                 }
+@@ -376,12 +407,75 @@ struct screen_consumer
+         return count > 0;
+     }
+ 
++#if defined(_MSC_VER)
++    // USM patch 0007 (screen-vsync-genlock): find the DXGI output for the monitor this window
++    // sits on, so tick() can WaitForVBlank on the RIGHT display. Runs once, on the present
++    // thread, just before the render loop. On any failure we leave genlock_output_ null and
++    // tick() uses the rate-cap fallback (never overclocks) instead of DwmFlush.
++    void acquire_genlock_output()
++    {
++        using Microsoft::WRL::ComPtr;
++        HWND     hwnd = static_cast<HWND>(window_.getSystemHandle());
++        HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
++
++        ComPtr<IDXGIFactory1> factory;
++        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())))) {
++            CASPAR_LOG(warning) << print() << L" vsync-genlock: CreateDXGIFactory1 failed — using rate-cap fallback.";
++            return;
++        }
++
++        ComPtr<IDXGIAdapter1> adapter;
++        for (UINT ai = 0; factory->EnumAdapters1(ai, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++ai) {
++            ComPtr<IDXGIOutput> output;
++            for (UINT oi = 0; adapter->EnumOutputs(oi, output.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++oi) {
++                DXGI_OUTPUT_DESC desc;
++                if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == hmon) {
++                    genlock_output_ = output;
++                    CASPAR_LOG(info) << print() << L" Enabled vsync-genlock (paced by the LED output's own vblank).";
++                    return;
++                }
++            }
++        }
++        CASPAR_LOG(warning) << print() << L" vsync-genlock: no DXGI output matched the window's monitor — using rate-cap fallback.";
++    }
++
++    // Fallback pacing when no output vblank is available: cap the tick loop to the channel
++    // rate with an absolute (drift-free) deadline. Unlike DwmFlush this can never chase a
++    // faster display and overclock the channel — worst case it degrades to a plain 50 Hz clock.
++    void genlock_fallback_pace()
++    {
++        const auto now    = std::chrono::high_resolution_clock::now();
++        const auto period = std::chrono::microseconds(static_cast<int>(1e6 / format_desc_.hz));
++        if (genlock_deadline_.time_since_epoch().count() == 0 || genlock_deadline_ < now) {
++            genlock_deadline_ = now;
++        }
++        genlock_deadline_ += period;
++        std::this_thread::sleep_until(genlock_deadline_);
++    }
++#endif
++
+     void tick()
+     {
+         strategy_->do_tick(this);
  
          window_.display();
  
 +#if defined(_MSC_VER)
-+        // USM patch 0007 (screen-vsync-genlock): block until the next DWM composition so
-+        // this tick loop — and therefore the whole channel, paced through
-+        // has_synchronization_clock() — advances on the DISPLAY'S clock, not the free-
-+        // running QPC softclock. On the windowed/borderless copy-path present (PresentMon
-+        // "Composed: Copy with GPU GDI", SyncInterval=-1) DwmFlush() is the only primitive
-+        // that aligns to when DWM actually samples our GL surface; collapses the QPC-vs-DWM
-+        // beat (the ~48 fps / 40 ms-repeat straddle) back to a clean 50.0.
++        // USM patch 0007 (screen-vsync-genlock): pace this tick loop — and therefore the whole
++        // channel, via has_synchronization_clock() — on the LED output monitor's OWN vblank, so
++        // it advances on that display's real refresh instead of the free-running QPC softclock.
++        // Uses IDXGIOutput::WaitForVBlank on the bound output (NOT DwmFlush, whose global
++        // composition clock follows the primary/fastest display and overclocked the channel to
++        // ~150 fps on a multi-monitor rig). Fallback caps to the channel rate — never overclocks.
 +        if (config_.vsync_genlock) {
-+            DwmFlush();
++            if (genlock_output_) {
++                genlock_output_->WaitForVBlank();
++            } else {
++                genlock_fallback_pace();
++            }
 +        }
 +#endif
 +
          std::rotate(frames_.begin(), frames_.begin() + 1, frames_.end());
  
          graph_->set_value("tick-time", tick_timer_.elapsed() * format_desc_.fps * 0.5);
-@@ -430,10 +455,22 @@ struct screen_consumer
+@@ -430,10 +524,22 @@ struct screen_consumer
  
      std::future<bool> send(core::video_field field, const core::const_frame& frame)
      {
@@ -84,7 +179,7 @@
              if (frame_buffer_.try_push(frame)) {
                  delivered = true;
                  break;
-@@ -752,7 +789,14 @@ struct screen_consumer_proxy : public core::frame_consumer
+@@ -752,7 +858,14 @@ struct screen_consumer_proxy : public core::frame_consumer
  
      std::wstring name() const override { return L"screen"; }
  
@@ -100,7 +195,7 @@
  
      int index() const override { return 600 + (config_.key_only ? 10 : 0) + config_.screen_index; }
  
-@@ -787,8 +831,11 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
+@@ -787,8 +900,11 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
          }
      }
  
@@ -114,7 +209,7 @@
      config.key_only    = contains_param(L"KEY_ONLY", params);
      config.sbs_key     = contains_param(L"SBS_KEY", params);
      config.interactive = !contains_param(L"NON_INTERACTIVE", params);
-@@ -843,6 +890,12 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
+@@ -843,6 +959,12 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
      config.borderless    = ptree.get(L"borderless", config.borderless);
      config.always_on_top = ptree.get(L"always-on-top", config.always_on_top);
      config.gpu_texture   = ptree.get(L"gpu-texture", config.gpu_texture);
