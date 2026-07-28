@@ -1,0 +1,149 @@
+--- a/src/modules/screen/consumer/screen_consumer.cpp
++++ b/src/modules/screen/consumer/screen_consumer.cpp
+@@ -235,6 +235,25 @@ struct screen_consumer
+     USM_PFN_wglDXUnregisterObjectNV usm_wglDXUnregisterObjectNV_ = nullptr;
+     USM_PFN_wglDXLockObjectsNV      usm_wglDXLockObjectsNV_      = nullptr;
+     USM_PFN_wglDXUnlockObjectsNV    usm_wglDXUnlockObjectsNV_    = nullptr;
++
++    // USM patch 0009 (flip-stats): once-a-minute present-pacing telemetry for the flip
++    // path. DXGI frame statistics (PresentRefreshCount advancing by MORE than
++    // PresentCount between consecutive presents) reveal frames that stayed on screen
++    // for 2+ refreshes — a missed vblank / stall that is invisible to BOTH the
++    // channel's drop counters and any averaged fps readout. Log-only; a statistics
++    // failure only resets the baseline, never touches playout.
++    UINT               flip_stats_last_refresh_count_ = 0;
++    UINT               flip_stats_last_present_count_ = 0;
++    bool               flip_stats_have_baseline_      = false;
++    unsigned long long flip_stats_presents_           = 0;
++    unsigned long long flip_stats_held_windows_       = 0; // sample windows where refreshes > presents
++    unsigned long long flip_stats_extra_refreshes_    = 0; // refreshes beyond 1-per-present (missed vblanks)
++    UINT               flip_stats_worst_span_         = 1; // worst refresh span of a single frame
++    unsigned long long flip_stats_disjoint_           = 0; // DXGI stats resets (mode change etc.)
++    unsigned long long flip_stats_late_gaps_          = 0; // Present()-to-Present() gap > 1.5 periods
++    double             flip_stats_worst_gap_ms_       = 0.0;
++    std::chrono::high_resolution_clock::time_point flip_stats_last_present_time_{};
++    std::chrono::high_resolution_clock::time_point flip_stats_last_log_time_{};
+ #endif
+ 
+     spl::shared_ptr<display_strategy> strategy_;
+@@ -683,6 +702,12 @@ struct screen_consumer
+ 
+     void flip_teardown()
+     {
++        // USM patch 0009 (flip-stats): flush the partial stats window before the state
++        // goes away — a mid-show fallback is exactly the moment the numbers matter.
++        // Guarded on flip_active_ so init-failure teardowns (no presents yet) stay quiet.
++        if (flip_active_ && flip_stats_presents_ > 0) {
++            flip_log_stats(L"final window");
++        }
+         flip_active_          = false;
+         flip_teardown_pending_ = false;
+         // Audit M4: an exception-path teardown can arrive with the interop object still
+@@ -744,9 +769,107 @@ struct screen_consumer
+         }
+         if (hr == DXGI_STATUS_OCCLUDED) {
+             genlock_fallback_pace();
++            // USM patch 0009 (flip-stats): an occluded present neither vblank-blocks nor
++            // displays, so drop the gap baseline — the first present after occlusion
++            // would otherwise register one bogus giant gap.
++            flip_stats_last_present_time_ = {};
++        } else {
++            flip_collect_stats();
+         }
+         return true;
+     }
++
++    // ─── USM patch 0009 (flip-stats) ──────────────────────────────────────────────
++    //
++    // Called after every successful, non-occluded Present(1). Two independent
++    // detectors, deliberately redundant so a driver that reports no frame statistics
++    // still yields the wall-clock signal:
++    //   (a) wall-clock Present()-to-Present() gap — Present(1) with frame latency 1
++    //       blocks on the display, so a healthy gap ≈ one refresh period; a gap over
++    //       1.5 periods means the channel stalled a refresh (a "held" frame).
++    //   (b) DXGI GetFrameStatistics — PresentRefreshCount advancing by more than
++    //       PresentCount between samples means a displayed frame spanned 2+ refreshes.
++    // Summarised as ONE info line per minute (a full show stays a few hundred lines);
++    // every failure path only resets the baseline — playout is never touched.
++    void flip_collect_stats()
++    {
++        const auto now = std::chrono::high_resolution_clock::now();
++        flip_stats_presents_++;
++
++        // (a) wall-clock gap. Same field-rate accounting as genlock_fallback_pace
++        // (audit M5): interlaced channels present per FIELD, so the healthy period
++        // is 1/(hz*2) there. Progressive (every LED rig) is unchanged.
++        const int    fields    = format_desc_.field_count == 2 ? 2 : 1;
++        const double period_ms = 1000.0 / (format_desc_.hz * fields);
++        if (flip_stats_last_present_time_.time_since_epoch().count() != 0) {
++            const double gap_ms =
++                std::chrono::duration<double, std::milli>(now - flip_stats_last_present_time_).count();
++            if (gap_ms > period_ms * 1.5) {
++                flip_stats_late_gaps_++;
++                if (gap_ms > flip_stats_worst_gap_ms_) {
++                    flip_stats_worst_gap_ms_ = gap_ms;
++                }
++            }
++        }
++        flip_stats_last_present_time_ = now;
++
++        // (b) DXGI frame statistics. Deltas are between OUR samples (one per present),
++        // so refreshes == presents is the healthy case. A delta gap over 300 refreshes
++        // (~6 s) is treated as a counter reset, not a stall — same bucket as DISJOINT.
++        DXGI_FRAME_STATISTICS fs = {};
++        const HRESULT         shr = flip_swapchain_->GetFrameStatistics(&fs);
++        if (shr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
++            flip_stats_disjoint_++;
++            flip_stats_have_baseline_ = false;
++        } else if (SUCCEEDED(shr)) {
++            if (flip_stats_have_baseline_ && fs.PresentCount > flip_stats_last_present_count_) {
++                const UINT presents  = fs.PresentCount - flip_stats_last_present_count_;
++                const UINT refreshes = fs.PresentRefreshCount - flip_stats_last_refresh_count_;
++                if (refreshes > presents) {
++                    const UINT extra = refreshes - presents;
++                    if (extra <= 300) {
++                        flip_stats_held_windows_++;
++                        flip_stats_extra_refreshes_ += extra;
++                        if (extra + 1 > flip_stats_worst_span_) {
++                            flip_stats_worst_span_ = extra + 1;
++                        }
++                    } else {
++                        flip_stats_disjoint_++;
++                    }
++                }
++            }
++            flip_stats_last_present_count_ = fs.PresentCount;
++            flip_stats_last_refresh_count_ = fs.PresentRefreshCount;
++            flip_stats_have_baseline_      = true;
++        }
++
++        if (flip_stats_last_log_time_.time_since_epoch().count() == 0) {
++            flip_stats_last_log_time_ = now;
++        }
++        if (now - flip_stats_last_log_time_ >= std::chrono::seconds(60)) {
++            flip_log_stats(L"last 60s");
++        }
++    }
++
++    // Emit the summary line and reset the per-window counters (the frame-statistics
++    // BASELINE survives — only the window accumulators restart).
++    void flip_log_stats(const wchar_t* window_label)
++    {
++        CASPAR_LOG(info) << print() << L" flip-stats " << window_label << L": presents="
++                         << flip_stats_presents_ << L" held-windows=" << flip_stats_held_windows_
++                         << L" extra-refreshes=" << flip_stats_extra_refreshes_ << L" worst-span="
++                         << flip_stats_worst_span_ << L" late-gaps=" << flip_stats_late_gaps_
++                         << L" worst-gap-ms=" << flip_stats_worst_gap_ms_ << L" disjoint="
++                         << flip_stats_disjoint_;
++        flip_stats_presents_        = 0;
++        flip_stats_held_windows_    = 0;
++        flip_stats_extra_refreshes_ = 0;
++        flip_stats_worst_span_      = 1;
++        flip_stats_late_gaps_       = 0;
++        flip_stats_worst_gap_ms_    = 0.0;
++        flip_stats_disjoint_        = 0;
++        flip_stats_last_log_time_   = std::chrono::high_resolution_clock::now();
++    }
+ #endif
+ 
+     void tick()
