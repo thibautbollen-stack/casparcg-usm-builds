@@ -1,0 +1,99 @@
+--- a/src/modules/screen/consumer/screen_consumer.cpp
++++ b/src/modules/screen/consumer/screen_consumer.cpp
+@@ -144,6 +144,13 @@ struct configuration
+     bool            gpu_texture   = false;
+     bool            vsync_genlock = false; // USM patch 0007 (screen-vsync-genlock)
+     bool            flip_present  = false; // USM patch 0008 (flip-present)
++    // USM patch 0010 (flip-latency): DXGI present-queue depth for the flip path.
++    // 1 (default) = lowest latency, zero slack — a render finishing late by 1 ms is a
++    // visibly held frame. 2..3 = deeper queue: a late render is absorbed on the extra
++    // queued frame, at +(N-1) refresh periods of present latency (invisible on an LED
++    // chain). <flip-latency> in config; USM_FLIP_LATENCY env var overrides for drop-in
++    // A/B testing without an app release.
++    int             flip_latency  = 1;
+ };
+ 
+ struct frame
+@@ -229,6 +236,9 @@ struct screen_consumer
+     HANDLE                                     flip_interop_object_ = nullptr;
+     GLuint                                     flip_gl_texture_     = 0;
+     GLuint                                     flip_fbo_            = 0;
++    // USM patch 0010 (flip-latency): resolved present-queue depth (config <flip-latency>
++    // overridden by USM_FLIP_LATENCY, clamped to [1,3]) — set in flip_init before use.
++    int                                        flip_latency_effective_ = 1;
+     USM_PFN_wglDXOpenDeviceNV       usm_wglDXOpenDeviceNV_       = nullptr;
+     USM_PFN_wglDXCloseDeviceNV      usm_wglDXCloseDeviceNV_      = nullptr;
+     USM_PFN_wglDXRegisterObjectNV   usm_wglDXRegisterObjectNV_   = nullptr;
+@@ -624,7 +634,25 @@ struct screen_consumer
+         if (FAILED(flip_device_.As(&dxgi_device))) {
+             return fail(L"IDXGIDevice1 unavailable");
+         }
+-        dxgi_device->SetMaximumFrameLatency(1);
++        // USM patch 0010 (flip-latency): effective queue depth = config <flip-latency>,
++        // overridden by USM_FLIP_LATENCY (single digit 1..3; anything else ignored),
++        // clamped to [1,3]. BufferCount below follows as depth+1.
++        int flip_effective_latency = config_.flip_latency;
++        {
++            wchar_t lat_buf[8] = {};
++            if (GetEnvironmentVariableW(L"USM_FLIP_LATENCY", lat_buf, 8) > 0 &&
++                lat_buf[0] >= L'1' && lat_buf[0] <= L'3' && lat_buf[1] == L'\0') {
++                flip_effective_latency = lat_buf[0] - L'0';
++            }
++        }
++        if (flip_effective_latency < 1) {
++            flip_effective_latency = 1;
++        }
++        if (flip_effective_latency > 3) {
++            flip_effective_latency = 3;
++        }
++        flip_latency_effective_ = flip_effective_latency;
++        dxgi_device->SetMaximumFrameLatency(static_cast<UINT>(flip_effective_latency));
+ 
+         Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+         Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
+@@ -641,7 +669,7 @@ struct screen_consumer
+         sc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+         sc.SampleDesc.Count   = 1;
+         sc.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+-        sc.BufferCount        = 2;
++        sc.BufferCount        = static_cast<UINT>(flip_latency_effective_ + 1); // USM patch 0010: depth+1
+         sc.SwapEffect         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+         sc.AlphaMode          = DXGI_ALPHA_MODE_IGNORE;
+         sc.Scaling            = DXGI_SCALING_STRETCH;
+@@ -698,6 +726,15 @@ struct screen_consumer
+         flip_drain_gl_errors();
+         flip_active_ = true;
+         CASPAR_LOG(info) << print() << L" Enabled flip-present (DXGI flip-model — off the DWM copy path).";
++        // USM patch 0010 (flip-latency): make the effective depth visible in the log —
++        // the drop-in A/B test and the fleet's flip-stats lines are read against this.
++        if (flip_latency_effective_ != 1) {
++            CASPAR_LOG(info) << print() << L" flip-latency: present queue depth "
++                             << flip_latency_effective_ << L" (BufferCount "
++                             << (flip_latency_effective_ + 1)
++                             << L") — late renders absorbed at +"
++                             << (flip_latency_effective_ - 1) << L" refresh period(s) latency.";
++        }
+     }
+ 
+     void flip_teardown()
+@@ -1384,6 +1421,11 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
+ #if defined(_MSC_VER)
+     config.vsync_genlock = contains_param(L"GENLOCK", params); // USM patch 0007 — Windows only (needs DwmFlush)
+     config.flip_present  = contains_param(L"FLIP", params);    // USM patch 0008 — Windows only (DXGI)
++    // USM patch 0010 — AMCP token for the deep queue, so an app-side consumer recovery
++    // (ADD ... FLIP FLIP_DEEP) can preserve a configured <flip-latency>2</flip-latency>.
++    if (contains_param(L"FLIP_DEEP", params)) {
++        config.flip_latency = 2;
++    }
+ #endif
+     config.key_only    = contains_param(L"KEY_ONLY", params);
+     config.sbs_key     = contains_param(L"SBS_KEY", params);
+@@ -1447,6 +1489,8 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
+     // USM patch 0008 (flip-present): parsed ONLY on MSVC — needs D3D11/DXGI; on any other
+     // platform the flag stays false and every flip code path above is dead.
+     config.flip_present  = ptree.get(L"flip-present", config.flip_present);
++    // USM patch 0010 (flip-latency): parsed ONLY on MSVC, same rationale as flip-present.
++    config.flip_latency  = ptree.get(L"flip-latency", config.flip_latency);
+ #endif
+ 
+     auto colour_space_value = ptree.get(L"colour-space", L"RGB");
