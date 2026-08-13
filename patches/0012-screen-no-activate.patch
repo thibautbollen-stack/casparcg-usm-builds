@@ -1,0 +1,155 @@
+diff --git a/src/modules/screen/consumer/screen_consumer.cpp b/src/modules/screen/consumer/screen_consumer.cpp
+index 280a90e..28417b9 100644
+--- a/src/modules/screen/consumer/screen_consumer.cpp
++++ b/src/modules/screen/consumer/screen_consumer.cpp
+@@ -166,6 +166,28 @@ struct configuration
+     // <flip-sync-interval> in config; USM_FLIP_SYNC env var overrides for drop-in
+     // A/B testing without an app release.
+     int             flip_sync_interval = 1;
++    // USM patch 0012 (screen-no-activate): never let the output window hold foreground
++    // focus.
++    //
++    // WHY. NVIDIA's driver promotes a FOCUSED, undecorated window that exactly covers
++    // a monitor to exclusive-fullscreen-style scanout ("Hardware: Legacy Flip" in
++    // PresentMon) on the first SwapBuffers — the window takes ownership of the display
++    // and DWM is switched off on that head. The operator's first click into the UI
++    // then forces a demotion back to DWM composition: a scanout teardown the monitor
++    // sees as a mode change (the first-click blink), and which some display chains
++    // (LED processors behind converters) fail to resync from — the head stays black,
++    // desktop included, until something forces a fresh modeset. A window that has
++    // NEVER been focused is never promoted, so neither transition can occur.
++    // Steady-state cost: none — after the operator's first click the classic window
++    // runs DWM-composed either way; this only removes the transition. The flip path
++    // (patch 0008) never had the problem (DWM keeps display ownership) but gets the
++    // same guard: its window is created focused too, and its one pre-flip_init
++    // SwapBuffers plus the mid-run flip->classic fallback both present on this HWND.
++    //
++    // <no-activate> in config; NOACTIVATE AMCP token so an app-side consumer recovery
++    // (ADD ... SCREEN) re-creates the window with the same guarantee instead of
++    // stealing foreground mid-show (which the pre-0012 recovery did).
++    bool            no_activate = false;
+ };
+ 
+ struct frame
+@@ -384,6 +406,12 @@ struct screen_consumer
+                 sf::VideoMode desktop      = sf::VideoMode::getDesktopMode();
+                 sf::VideoMode mode(
+                     config_.sbs_key ? screen_width_ * 2 : screen_width_, screen_height_, desktop.bitsPerPixel);
++#if defined(_MSC_VER)
++                // USM patch 0012 (screen-no-activate): remember who held foreground
++                // BEFORE SFML's CreateWindowExW(WS_VISIBLE) steals it, so it can be
++                // handed straight back once the window styles are settled below.
++                HWND usm_prev_fg = config_.no_activate ? GetForegroundWindow() : nullptr;
++#endif
+                 window_.create(mode,
+                                u8(print()),
+                                window_style,
+@@ -401,6 +429,86 @@ struct screen_consumer
+ #endif
+                 }
+ 
++#if defined(_MSC_VER)
++                // USM patch 0012 (screen-no-activate) — see the configuration comment.
++                // Must complete BEFORE the first SwapBuffers (glClear + window_.display()
++                // below): the driver's promotion check runs at present time, so a window
++                // that sheds activation here is examined as an unfocused window and left
++                // on the composed path. The whole lambda is synchronous, so there is no
++                // race between this block and that first present.
++                if (config_.no_activate) {
++                    HWND hwnd = static_cast<HWND>(window_.getSystemHandle());
++                    // Never activatable by pointer input again. No wndproc subclass is
++                    // needed: SFML forwards unhandled messages to DefWindowProc, whose
++                    // WM_MOUSEACTIVATE handling honours WS_EX_NOACTIVATE — clicks reach
++                    // the window but never move foreground onto it. (The app-side
++                    // OutputGuard sweep sets the same bit ~200 ms later; too late for
++                    // the first present, which is why it lives here.)
++                    SetWindowLongPtrW(
++                        hwnd, GWL_EXSTYLE, GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
++                    // Style bits are cached — SetWindowPos with SWP_FRAMECHANGED is the
++                    // documented way to flush them.
++                    SetWindowPos(hwnd,
++                                 nullptr,
++                                 0,
++                                 0,
++                                 0,
++                                 0,
++                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
++                    // Shed the activation window creation already took.
++                    if (GetForegroundWindow() == hwnd) {
++                        DWORD usm_prev_pid = 0;
++                        if (usm_prev_fg && IsWindow(usm_prev_fg)) {
++                            GetWindowThreadProcessId(usm_prev_fg, &usm_prev_pid);
++                        }
++                        if (usm_prev_pid != 0 && usm_prev_pid != GetCurrentProcessId()) {
++                            // This process holds foreground, so it is permitted to give
++                            // it away (SetForegroundWindow's rules).
++                            SetForegroundWindow(usm_prev_fg);
++                        }
++                        if (GetForegroundWindow() == hwnd) {
++                            // Previous owner gone, foreign-locked, or it was another of
++                            // our own consumer windows (multi-screen interleave): a
++                            // hide/show cycle makes the OS reassign activation, and the
++                            // reassignment search skips NOACTIVATE windows. If even
++                            // this fails, behaviour degrades exactly to the pre-0012
++                            // baseline — never worse.
++                            ShowWindow(hwnd, SW_HIDE);
++                            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
++                        }
++                    }
++                    CASPAR_LOG(info) << print()
++                                     << L" no-activate: window can never hold foreground "
++                                     << L"(scanout-promotion guard).";
++
++                    // Diagnostic knob: USM_GL_INSET=1 shrinks the window 1 px
++                    // vertically — a window that does not exactly cover its monitor
++                    // fails the driver's promotion geometry check even if it somehow
++                    // ends up focused (SDL issue #12791 confirmed the 1 px defeat).
++                    // Classic path only: patch 0008 tears flip down on any resize. The
++                    // bottom pixel row shows desktop, so this is triage, not
++                    // production. Single digit '1' exactly, like USM_FLIP_LATENCY.
++                    if (!config_.flip_present) {
++                        wchar_t usm_inset_buf[8] = {};
++                        if (GetEnvironmentVariableW(L"USM_GL_INSET", usm_inset_buf, 8) > 0 &&
++                            usm_inset_buf[0] == L'1' && usm_inset_buf[1] == L'\0') {
++                            const auto usm_size = window_.getSize();
++                            SetWindowPos(hwnd,
++                                         nullptr,
++                                         0,
++                                         0,
++                                         static_cast<int>(usm_size.x),
++                                         static_cast<int>(usm_size.y) - 1,
++                                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
++                            CASPAR_LOG(warning)
++                                << print()
++                                << L" USM_GL_INSET=1 — window is 1 px short of the monitor "
++                                << L"(promotion-geometry diagnostic; bottom row shows desktop).";
++                        }
++                    }
++                }
++#endif
++
+                 if (glewInit() != GLEW_OK) {
+                     CASPAR_THROW_EXCEPTION(gl::ogl_exception() << msg_info("Failed to initialize GLEW."));
+                 }
+@@ -1530,6 +1638,10 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
+     if (contains_param(L"FLIP_SYNC2", params)) {
+         config.flip_sync_interval = 2;
+     }
++    // USM patch 0012 — AMCP token so an app-side consumer recovery (ADD ... SCREEN)
++    // re-creates the window without stealing foreground mid-show, keeping the
++    // never-focused guarantee (see the configuration comment).
++    config.no_activate = contains_param(L"NOACTIVATE", params);
+ #endif
+     config.key_only    = contains_param(L"KEY_ONLY", params);
+     config.sbs_key     = contains_param(L"SBS_KEY", params);
+@@ -1598,6 +1710,10 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
+     // USM patch 0011 (flip sync interval): parsed ONLY on MSVC, same rationale as
+     // flip-present. 1 = unchanged behaviour, so an absent element is a no-op.
+     config.flip_sync_interval = ptree.get(L"flip-sync-interval", config.flip_sync_interval);
++    // USM patch 0012 (screen-no-activate): parsed ONLY on MSVC — the promotion being
++    // guarded against is a Windows/NVIDIA driver behaviour, and the guard is Win32.
++    // Absent element = false = byte-identical pre-0012 behaviour.
++    config.no_activate = ptree.get(L"no-activate", config.no_activate);
+ #endif
+ 
+     auto colour_space_value = ptree.get(L"colour-space", L"RGB");

@@ -1,0 +1,181 @@
+diff --git a/src/modules/screen/consumer/screen_consumer.cpp b/src/modules/screen/consumer/screen_consumer.cpp
+index eca20f2b..280a90e1 100644
+--- a/src/modules/screen/consumer/screen_consumer.cpp
++++ b/src/modules/screen/consumer/screen_consumer.cpp
+@@ -151,6 +151,21 @@ struct configuration
+     // chain). <flip-latency> in config; USM_FLIP_LATENCY env var overrides for drop-in
+     // A/B testing without an app release.
+     int             flip_latency  = 1;
++    // USM patch 0011 (flip sync interval): DXGI Present() sync interval — how many
++    // vblanks each presented frame is held for.
++    //
++    // WHY. Present(1) holds one vblank, so flip only paces correctly when the display
++    // refresh EQUALS the channel fps; the app demotes any mismatch to the classic
++    // OpenGL path ("50 Hz but the channel is 25 fps"). But an INTEGER MULTIPLE is
++    // perfectly presentable: a 25 fps channel on a 50 Hz display is Present(2) — every
++    // second vblank — which is correctly paced AND genlocked. Without this, every
++    // mixed-rate rig is stuck on the classic path, and that is the path which blinks
++    // for ~0.2s on the first foreground change after playout starts.
++    //
++    // 1 (default) = unchanged behaviour. 2..4 = display refresh / channel fps.
++    // <flip-sync-interval> in config; USM_FLIP_SYNC env var overrides for drop-in
++    // A/B testing without an app release.
++    int             flip_sync_interval = 1;
+ };
+ 
+ struct frame
+@@ -239,6 +254,9 @@ struct screen_consumer
+     // USM patch 0010 (flip-latency): resolved present-queue depth (config <flip-latency>
+     // overridden by USM_FLIP_LATENCY, clamped to [1,3]) — set in flip_init before use.
+     int                                        flip_latency_effective_ = 1;
++    // USM patch 0011: resolved Present() sync interval (config <flip-sync-interval>
++    // overridden by USM_FLIP_SYNC, clamped to [1,4]) — set in flip_init before use.
++    int                                        flip_sync_effective_ = 1;
+     USM_PFN_wglDXOpenDeviceNV       usm_wglDXOpenDeviceNV_       = nullptr;
+     USM_PFN_wglDXCloseDeviceNV      usm_wglDXCloseDeviceNV_      = nullptr;
+     USM_PFN_wglDXRegisterObjectNV   usm_wglDXRegisterObjectNV_   = nullptr;
+@@ -592,9 +610,37 @@ struct screen_consumer
+ 
+     void flip_init()
+     {
+-        const auto fail = [this](const wchar_t* what) {
+-            CASPAR_LOG(warning) << print() << L" flip-present: " << what
+-                                << L" — using windowed present (rate-capped) instead.";
++        // USM patch 0011 (diagnostics): the HRESULT is the whole diagnosis and this
++        // lambda used to throw it away — every possible cause of a flip failure logged
++        // the identical sentence, which is why a rig failing at CreateSwapChainForHwnd
++        // could not be triaged from its logs at all. Decoded by name: no <iomanip>
++        // dependency, and a name is more use in a field log than raw hex.
++        const auto hr_name = [](HRESULT hr) -> const wchar_t* {
++            switch (hr) {
++                case 0x887A0001L: return L"DXGI_ERROR_INVALID_CALL";
++                case 0x887A0004L: return L"DXGI_ERROR_UNSUPPORTED";
++                case 0x887A0005L: return L"DXGI_ERROR_DEVICE_REMOVED";
++                case 0x887A0006L: return L"DXGI_ERROR_DEVICE_HUNG";
++                case 0x887A0007L: return L"DXGI_ERROR_DEVICE_RESET";
++                case 0x887A0020L: return L"DXGI_ERROR_NOT_CURRENTLY_AVAILABLE";
++                case 0x887A002DL: return L"DXGI_ERROR_SDK_COMPONENT_MISSING";
++                case 0x80070057L: return L"E_INVALIDARG";
++                case 0x8007000EL: return L"E_OUTOFMEMORY";
++                case 0x80004001L: return L"E_NOTIMPL";
++                case 0x80004005L: return L"E_FAIL";
++                case 0x80070005L: return L"E_ACCESSDENIED";
++                default:          return L"(unrecognised)";
++            }
++        };
++        const auto fail = [this, hr_name](const wchar_t* what, HRESULT hr = S_OK) {
++            if (hr != S_OK) {
++                CASPAR_LOG(warning) << print() << L" flip-present: " << what << L" — hr="
++                                    << static_cast<long>(hr) << L" " << hr_name(hr)
++                                    << L" — using windowed present (rate-capped) instead.";
++            } else {
++                CASPAR_LOG(warning) << print() << L" flip-present: " << what
++                                    << L" — using windowed present (rate-capped) instead.";
++            }
+             flip_teardown();
+             flip_drain_gl_errors();
+         };
+@@ -673,9 +719,36 @@ struct screen_consumer
+         sc.SwapEffect         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+         sc.AlphaMode          = DXGI_ALPHA_MODE_IGNORE;
+         sc.Scaling            = DXGI_SCALING_STRETCH;
+-        if (FAILED(factory->CreateSwapChainForHwnd(
+-                flip_device_.Get(), hwnd, &sc, nullptr, nullptr, flip_swapchain_.GetAddressOf()))) {
+-            return fail(L"CreateSwapChainForHwnd (flip model) failed");
++        HRESULT sc_hr = factory->CreateSwapChainForHwnd(
++            flip_device_.Get(), hwnd, &sc, nullptr, nullptr, flip_swapchain_.GetAddressOf());
++        if (FAILED(sc_hr)) {
++            // USM patch 0011: retry with DXGI_SCALING_NONE before giving up.
++            //
++            // STRETCH is the conventional choice and works on most drivers, but it is
++            // not universally accepted for a flip-model swapchain on a borderless
++            // window that exactly covers its monitor — and the swapchain is always
++            // created at the monitor's exact size, so there is nothing to scale in the
++            // first place. NONE is the semantically correct value here; STRETCH was
++            // only chosen because it is the DXGI default.
++            //
++            // Costs one extra call on a rig that was going to fall back to the classic
++            // OpenGL path anyway — and that path is the one that flickers, so a second
++            // attempt is cheap next to what it buys.
++            const HRESULT stretch_hr = sc_hr;
++            sc.Scaling = DXGI_SCALING_NONE;
++            sc_hr      = factory->CreateSwapChainForHwnd(
++                flip_device_.Get(), hwnd, &sc, nullptr, nullptr, flip_swapchain_.GetAddressOf());
++            if (SUCCEEDED(sc_hr)) {
++                CASPAR_LOG(info) << print()
++                                 << L" flip-present: CreateSwapChainForHwnd rejected "
++                                    L"DXGI_SCALING_STRETCH (hr="
++                                 << static_cast<long>(stretch_hr)
++                                 << L") — succeeded with DXGI_SCALING_NONE.";
++            } else {
++                return fail(L"CreateSwapChainForHwnd (flip model) failed with both "
++                            L"DXGI_SCALING_STRETCH and DXGI_SCALING_NONE",
++                            sc_hr);
++            }
+         }
+         factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+ 
+@@ -726,6 +799,30 @@ struct screen_consumer
+         flip_drain_gl_errors();
+         flip_active_ = true;
+         CASPAR_LOG(info) << print() << L" Enabled flip-present (DXGI flip-model — off the DWM copy path).";
++        // USM patch 0011: resolve the Present() sync interval — config
++        // <flip-sync-interval>, overridden by USM_FLIP_SYNC (single digit 1..4),
++        // clamped to [1,4]. 1 keeps the pre-0011 behaviour exactly.
++        {
++            int     sync        = config_.flip_sync_interval;
++            wchar_t sync_buf[8] = {};
++            if (GetEnvironmentVariableW(L"USM_FLIP_SYNC", sync_buf, 8) > 0 && sync_buf[0] >= L'1' &&
++                sync_buf[0] <= L'4' && sync_buf[1] == L'\0') {
++                sync = sync_buf[0] - L'0';
++            }
++            if (sync < 1) {
++                sync = 1;
++            }
++            if (sync > 4) {
++                sync = 4;
++            }
++            flip_sync_effective_ = sync;
++            if (flip_sync_effective_ != 1) {
++                CASPAR_LOG(info) << print() << L" flip-present: Present sync interval "
++                                 << flip_sync_effective_ << L" — one presented frame per "
++                                 << flip_sync_effective_
++                                 << L" vblanks (display refresh is that multiple of the channel rate).";
++            }
++        }
+         // USM patch 0010 (flip-latency): make the effective depth visible in the log —
+         // the drop-in A/B test and the fleet's flip-stats lines are read against this.
+         if (flip_latency_effective_ != 1) {
+@@ -800,7 +897,7 @@ struct screen_consumer
+             return false;
+         }
+         flip_context_->CopyResource(backbuffer.Get(), flip_texture_.Get());
+-        const HRESULT hr = flip_swapchain_->Present(1, 0);
++        const HRESULT hr = flip_swapchain_->Present(static_cast<UINT>(flip_sync_effective_), 0);
+         if (FAILED(hr)) {
+             return false;
+         }
+@@ -1426,6 +1523,13 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
+     if (contains_param(L"FLIP_DEEP", params)) {
+         config.flip_latency = 2;
+     }
++    // USM patch 0011 — AMCP token for the sync interval, so an app-side consumer
++    // recovery (ADD ... FLIP FLIP_SYNC2) preserves a configured
++    // <flip-sync-interval>2</flip-sync-interval> instead of silently reverting to
++    // Present(1) and running a mixed-rate wall at the wrong speed.
++    if (contains_param(L"FLIP_SYNC2", params)) {
++        config.flip_sync_interval = 2;
++    }
+ #endif
+     config.key_only    = contains_param(L"KEY_ONLY", params);
+     config.sbs_key     = contains_param(L"SBS_KEY", params);
+@@ -1491,6 +1595,9 @@ create_preconfigured_consumer(const boost::property_tree::wptree&
+     config.flip_present  = ptree.get(L"flip-present", config.flip_present);
+     // USM patch 0010 (flip-latency): parsed ONLY on MSVC, same rationale as flip-present.
+     config.flip_latency  = ptree.get(L"flip-latency", config.flip_latency);
++    // USM patch 0011 (flip sync interval): parsed ONLY on MSVC, same rationale as
++    // flip-present. 1 = unchanged behaviour, so an absent element is a no-op.
++    config.flip_sync_interval = ptree.get(L"flip-sync-interval", config.flip_sync_interval);
+ #endif
+ 
+     auto colour_space_value = ptree.get(L"colour-space", L"RGB");
